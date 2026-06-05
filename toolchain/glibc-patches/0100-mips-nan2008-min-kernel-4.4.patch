@@ -1,12 +1,24 @@
 Lower the MIPS o32 nan2008 minimum kernel from 4.5.0 to 4.4.0.
 
-glibc gates the o32 nan2008/fp64 ABI on a 4.5.0 minimum kernel (mainline stabilized
-FR=1/FP64 context support around 4.5). The Ender 3 V3 KE's Ingenic X2000 runs a vendor
-4.4.94 kernel that backports that support, and Creality/Ingenic ship a glibc 2.29 built
-against it — so the device legitimately runs this ABI on 4.4. We patch the floor to 4.4.0
-(<= the device's 4.4.94) so our binaries' recorded minimum lets them load on the device.
-Only the generated `configure` is touched (not configure.ac) to avoid triggering an
-autoreconf with a mismatched autoconf version.
+glibc pins a 4.5.0 minimum kernel for the o32 nan2008/fp64 ABI because mainline didn't
+guarantee correct FR=1/FP64 register context handling until ~4.5. It's a HARD floor: the
+effective minimum is max(--enable-kernel, arch_minimum_kernel), so our explicit
+--enable-kernel=4.4.0 (CT_GLIBC_MIN_KERNEL) is overridden back up to 4.5.0 unless this floor is
+lowered. glibc has no flag to force the minimum below the floor — by design; patching is the
+sanctioned escape hatch, and it's exactly what Ingenic did to ship glibc 2.29/nan2008 on the
+device's 4.4 kernel.
+
+The Ender 3 V3 KE's Ingenic X2000 runs a vendor 4.4.94 kernel that backports the FR=1/FP64
+support, so the 4.5 floor is wrong for this hardware. VERIFIED on-device — toolchain/tests/
+fp64test.c, built with this toolchain's default flags, produces correct 2008 NaNs and
+bit-identical fp64 results under thread contention on the 4.4.94 kernel (i.e. the kernel really
+does save/restore the 64-bit FP registers across context switches). So 4.4.0 is the honest
+floor, and it keeps glibc's pre-4.5 syscall fallbacks rather than assuming 4.5+.
+
+(With our 4.14 kernel headers the build no longer FAILS without this patch — 4.14 >= 4.5 clears
+glibc's header-version check — but without it the recorded minimum would be 4.5.0, not 4.4.0.
+Only the generated `configure` is touched, not configure.ac, to avoid an autoreconf with a
+mismatched autoconf version.)
 
 --- a/sysdeps/unix/sysv/linux/mips/configure
 +++ b/sysdeps/unix/sysv/linux/mips/configure
