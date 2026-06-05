@@ -4,3 +4,8 @@
 # The cross toolchain is built into a container image (toolchain/Containerfile), not checked
 # out here — so nothing under toolchain/ to ignore. Build outputs:
 external/*/out/
+
+# Compiled v3ke CLI (build it via tools/v3ke; see tools/v3ke/README.md) + nim cache
+/tools/v3ke/v3ke
+/tools/v3ke/nimcache/
+nimcache/
