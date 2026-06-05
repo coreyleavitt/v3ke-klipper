@@ -1,0 +1,9 @@
+[submodule "external/klipper"]
+	path = external/klipper
+	url = https://github.com/Klipper3d/klipper.git
+[submodule "external/katapult"]
+	path = external/katapult
+	url = https://github.com/Arksine/katapult.git
+[submodule "external/mainsail-config"]
+	path = external/mainsail-config
+	url = https://github.com/mainsail-crew/mainsail-config.git

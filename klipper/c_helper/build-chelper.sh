@@ -4,18 +4,28 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-export TOOLCHAIN=../mips-toolchain/mips32r5el--glibc--bleeding-edge-2018.11-1
+# Repo root is two levels up from klipper/c_helper. Toolchain and the klipper
+# submodule both live under the repo, so chelper and the host-mcu build agree.
+# In the container image CROSS_TOOLCHAIN points at the crosstool-ng install; otherwise
+# fall back to a toolchain checked out under the repo.
+REPO_ROOT="$(cd ../.. && pwd)"
+export TOOLCHAIN="${CROSS_TOOLCHAIN:-${REPO_ROOT}/toolchain/mips32r5el--glibc--bleeding-edge-2018.11-1}"
 export SYSROOT=${TOOLCHAIN}/mipsel-buildroot-linux-gnu/sysroot
 export PATH="$TOOLCHAIN/bin:$PATH"
+
+if [ ! -x "${TOOLCHAIN}/bin/mipsel-buildroot-linux-gnu-gcc" ]; then
+  echo "MIPS toolchain missing at ${TOOLCHAIN}. Build via toolchain/build-image.sh and run through build-in-container.sh, or set CROSS_TOOLCHAIN." >&2
+  exit 2
+fi
 
 CC=$(ls "$TOOLCHAIN"/bin/*gcc | head -n1)
 echo "Using CC: $CC"
 echo ""
 
-CHELPER_DIR="../../../klipper/klippy/chelper"
+CHELPER_DIR="${REPO_ROOT}/external/klipper/klippy/chelper"
 
 echo -n "Building c_helper from klipper commit: "
-(cd $CHELPER_DIR && git status | grep "HEAD detached")
+git -C "$CHELPER_DIR" rev-parse --short HEAD 2>/dev/null || echo "(git unavailable)"
 
 if [ -f ${CHELPER_DIR}/c_helper.so ]; then
   echo -n "Remove old file: "

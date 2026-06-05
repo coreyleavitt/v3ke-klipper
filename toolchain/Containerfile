@@ -1,0 +1,65 @@
+# Reproducible, distributable cross-build environment for mainline Klipper on the Ender 3 V3 KE.
+#
+# The cross toolchain (gcc/glibc matching the device ABI) is built INTO this image, so the image
+# is self-contained and distributable (podman save / push). Build-time cache mounts keep the
+# downloads and object files (ccache) across rebuilds so iterating is cheap. Reproducibility
+# comes from crosstool-ng's pinned component versions + checksums, so the base is not pinned.
+#
+# Build:   ./toolchain/build-image.sh        (builds image incl. toolchain; ~20-40 min first time)
+# Backup:  ./toolchain/snapshot-toolchain.sh (copy toolchain -> named volume, dev safety net)
+# Use:     ../build-in-container.sh           (build device artifacts with this image)
+FROM opensuse/tumbleweed:latest
+
+# Host build deps for crosstool-ng + glibc/gcc, ccache for fast rebuilds, and arm bare-metal
+# for the STM32/GD32 MCU firmware.
+# `dup` first: a rolling base image can be a newer snapshot than the current repo mirror, which
+# breaks devel/runtime version matches (e.g. ncurses-devel vs libncurses6). dup reconciles to one
+# consistent snapshot before installing.
+RUN zypper -n --gpg-auto-import-keys refresh \
+ && zypper -n dup --no-recommends --auto-agree-with-licenses \
+ && zypper -n install --no-recommends \
+      gcc gcc-c++ gcc13 gcc13-c++ make patch automake autoconf libtool gettext-tools \
+      bison flex texinfo help2man gperf ncurses-devel ccache \
+      curl wget tar xz bzip2 gzip unzip which findutils file gawk sed rsync python3 git \
+      glibc-devel \
+      cross-arm-none-gcc14 cross-arm-none-newlib-devel \
+ && zypper clean -a
+
+# --- crosstool-ng (pinned release, checksum-verified) ---
+ARG CTNG_VERSION=1.28.0
+RUN set -eux; cd /tmp; \
+    base="https://github.com/crosstool-ng/crosstool-ng/releases/download/crosstool-ng-${CTNG_VERSION}"; \
+    curl -fsSLO "${base}/crosstool-ng-${CTNG_VERSION}.tar.xz"; \
+    curl -fsSLO "${base}/crosstool-ng-${CTNG_VERSION}.tar.xz.sha512"; \
+    sha512sum -c "crosstool-ng-${CTNG_VERSION}.tar.xz.sha512"; \
+    tar xf "crosstool-ng-${CTNG_VERSION}.tar.xz"; \
+    cd "crosstool-ng-${CTNG_VERSION}"; \
+    ./configure --prefix=/opt/ctng; make -j"$(nproc)"; make install; \
+    cd /; rm -rf /tmp/crosstool-ng-*
+ENV PATH=/opt/ctng/bin:$PATH
+
+# crosstool-ng refuses to run as root. Fixed uid/gid so the build-cache mounts below own cleanly.
+RUN groupadd -g 1000 ct && useradd -m -u 1000 -g 1000 ct \
+ && mkdir -p /opt/x-tools /home/ct/src /home/ct/.ccache /home/ct/build /opt/ctng-cfg \
+ && chown -R ct:ct /opt/x-tools /home/ct
+COPY crosstool-ng.fragment /opt/ctng-cfg/crosstool-ng.fragment
+COPY ct-build.sh /usr/local/bin/ct-build
+RUN chmod +x /usr/local/bin/ct-build
+# Lower glibc's MIPS nan2008 minimum-kernel floor (4.5.0 -> 4.4.0) to match the device's
+# Ingenic 4.4.94 kernel; ct-ng auto-applies bundled patches from this dir.
+COPY glibc-patches/0100-mips-nan2008-min-kernel-4.4.patch \
+     /opt/ctng/share/crosstool-ng/packages/glibc/2.29/
+
+USER ct
+WORKDIR /home/ct/build
+# Build the toolchain into the image. Cache mounts (downloads + ccache) persist across image
+# builds so re-runs don't re-download and recompile from scratch. ct-build validates the config
+# and the produced ABI (must emit the device's ld-linux-mipsn8.so.1) and fails the build if not.
+RUN --mount=type=cache,target=/home/ct/src,uid=1000,gid=1000 \
+    --mount=type=cache,target=/home/ct/.ccache,uid=1000,gid=1000 \
+    ct-build
+
+USER root
+ENV CROSS_TOOLCHAIN=/opt/x-tools/mipsel-buildroot-linux-gnu
+ENV PATH=/opt/x-tools/mipsel-buildroot-linux-gnu/bin:/opt/ctng/bin:$PATH
+WORKDIR /work

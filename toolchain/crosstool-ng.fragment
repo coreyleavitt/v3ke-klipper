@@ -1,0 +1,60 @@
+# crosstool-ng config overrides for the Ender 3 V3 KE (Ingenic X2000 / XBurst2).
+#
+# Applied on top of the bundled `mipsel-unknown-linux-gnu` sample, then `ct-ng olddefconfig`
+# (see toolchain/Containerfile). Everything here is dictated by on-device facts (CLAUDE.md):
+#   glibc 2.29 · kernel 4.4.94 · mipsel · mips32r2 · o32 · hard-float · fp64 · nan2008
+# The loader on the device is ld-linux-mipsn8.so.1 — the `-mnan=2008 -mfp64` CFLAGS below are
+# what make glibc emit that same mipsn8 loader, so our binaries match the device ABI exactly.
+
+# Surface era-appropriate (obsolete) component versions so the pins below are selectable.
+CT_EXPERIMENTAL=y
+CT_OBSOLETE=y
+
+# --- MIPS ABI (must match the device) ---
+CT_ARCH_ARCH="mips32r2"
+CT_ARCH_mips_o32=y
+CT_ARCH_FLOAT_HW=y
+CT_TARGET_CFLAGS="-mnan=2008 -mfp64"
+# Vendor "buildroot" => tuple mipsel-buildroot-linux-gnu, matching the prefix the build
+# scripts already expect (and the original Bootlin toolchain).
+CT_TARGET_VENDOR="buildroot"
+# Make the COMPILER ITSELF default to the device ABI (not just the libs built with the CFLAGS
+# above). Without this gcc defaults to legacy-NaN/FP32, so anything compiled with no explicit
+# flags (e.g. klipper's host-MCU build) asks for gnu/stubs-o32_hard.h while glibc only ships the
+# nan2008 variant stubs-o32_hard_2008.h -> "No such file" build failure.
+CT_CC_GCC_CORE_EXTRA_CONFIG_ARRAY="--with-nan=2008 --with-fp-32=64"
+CT_CC_GCC_EXTRA_CONFIG_ARRAY="--with-nan=2008 --with-fp-32=64"
+
+# --- Component versions: era-coherent ---
+# NB: crosstool-ng version symbols differ per package — glibc/binutils use full minor
+# (V_2_29, V_2_32), gcc uses the major milestone (V_8 => 8.5.0), linux uses major.minor
+# (V_4_14 => 4.14.329). Wrong names silently fall back to defaults, so they're asserted below.
+# Kernel HEADERS are 4.14 (not the device's 4.4): klipper's Linux-process MCU includes
+# <linux/gpio.h> (GPIO chardev UAPI, added in 4.8), absent from 4.4 headers. This only affects
+# what UAPI is *visible* at compile time; the glibc runtime minimum is pinned to 4.4.0 below.
+CT_GLIBC_V_2_29=y
+CT_GCC_V_8=y
+CT_BINUTILS_V_2_32=y
+CT_LINUX_V_4_14=y
+
+# --- glibc minimum kernel ---
+# Pin the runtime minimum to the DEVICE kernel (4.4.0), NOT the (newer, 4.14) headers above.
+# This keeps glibc's fallback paths for 4.4-era syscalls and stamps an honest min-kernel that
+# the device (4.4.94) satisfies. Combined with glibc-patches/0100-* (which lowers the MIPS
+# nan2008 floor from 4.5.0 to 4.4.0), the effective --enable-kernel stays 4.4.0.
+# CT_GLIBC_KERNEL_VERSION_AS_HEADERS is not set
+CT_GLIBC_KERNEL_VERSION_CHOSEN=y
+CT_GLIBC_MIN_KERNEL_VERSION="4.4.0"
+
+# --- Install location + trim ---
+CT_PREFIX_DIR="/opt/x-tools/${CT_TARGET}"
+# Disable debug facilities — not needed to build the device userland, gdbserver fails its
+# target-cpp sanity check, and skipping gdb/strace/duma saves ~17 min. (Symbols are uppercase.)
+# CT_DEBUG_GDB is not set
+# CT_DEBUG_DUMA is not set
+# CT_DEBUG_STRACE is not set
+# CT_DEBUG_LTRACE is not set
+
+# --- Download cache (mounted as a named volume so re-runs don't re-download) ---
+CT_LOCAL_TARBALLS_DIR="/home/ct/src"
+CT_SAVE_TARBALLS=y

@@ -1,0 +1,19 @@
+Lower the MIPS o32 nan2008 minimum kernel from 4.5.0 to 4.4.0.
+
+glibc gates the o32 nan2008/fp64 ABI on a 4.5.0 minimum kernel (mainline stabilized
+FR=1/FP64 context support around 4.5). The Ender 3 V3 KE's Ingenic X2000 runs a vendor
+4.4.94 kernel that backports that support, and Creality/Ingenic ship a glibc 2.29 built
+against it — so the device legitimately runs this ABI on 4.4. We patch the floor to 4.4.0
+(<= the device's 4.4.94) so our binaries' recorded minimum lets them load on the device.
+Only the generated `configure` is touched (not configure.ac) to avoid triggering an
+autoreconf with a mismatched autoconf version.
+
+--- a/sysdeps/unix/sysv/linux/mips/configure
++++ b/sysdeps/unix/sysv/linux/mips/configure
+@@ -473,5 +473,5 @@ libc_cv_gcc_unwind_find_fde=yes
+ if test -z "$arch_minimum_kernel"; then
+   if test x$libc_cv_mips_nan2008 = xyes; then
+-    arch_minimum_kernel=4.5.0
++    arch_minimum_kernel=4.4.0
+   fi
+ fi

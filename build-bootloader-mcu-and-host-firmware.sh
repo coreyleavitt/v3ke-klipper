@@ -6,9 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 SCRIPT_DIR="$(cd . && pwd)"
-KATAPULT_ROOT_DIR="$(cd ../katapult && pwd)"
+# klipper/katapult are vendored as submodules under external/ (see external/ + .gitmodules)
+KATAPULT_ROOT_DIR="$(cd external/katapult && pwd)"
 KATAPULT_CONFIG="$(cd mcu-firmware/ && pwd)/katapult.config"
-KLIPPER_ROOT_DIR="$(cd ../klipper && pwd)"
+KLIPPER_ROOT_DIR="$(cd external/klipper && pwd)"
 KLIPPER_CONFIG="$(cd mcu-firmware/ && pwd)/klipper.config"
 
 if [ ! -d "$KATAPULT_ROOT_DIR" ]; then
@@ -32,7 +33,7 @@ echo ""
 echo "Starting katapult build ..."
 pushd "$KATAPULT_ROOT_DIR" >/dev/null
 make clean KCONFIG_CONFIG="$KATAPULT_CONFIG" >/dev/null
-make menuconfig KCONFIG_CONFIG="$KATAPULT_CONFIG"
+make olddefconfig KCONFIG_CONFIG="$KATAPULT_CONFIG"
 make -j$(nproc) KCONFIG_CONFIG="$KATAPULT_CONFIG" >/dev/null
 cp -v "${KATAPULT_ROOT_DIR}"/out/katapult.* "${SCRIPT_DIR}/mcu-firmware"
 popd >/dev/null
@@ -42,7 +43,7 @@ echo ""
 echo "Starting klipper build ..."
 pushd "$KLIPPER_ROOT_DIR" >/dev/null
 make clean KCONFIG_CONFIG="$KLIPPER_CONFIG" >/dev/null
-make menuconfig KCONFIG_CONFIG="$KLIPPER_CONFIG"
+make olddefconfig KCONFIG_CONFIG="$KLIPPER_CONFIG"
 make -j$(nproc) KCONFIG_CONFIG="$KLIPPER_CONFIG" >/dev/null
 cp -v "${KLIPPER_ROOT_DIR}"/out/klipper.* "${SCRIPT_DIR}/mcu-firmware"
 popd >/dev/null
@@ -54,7 +55,10 @@ klipper/klipper_host_mcu/build-klipper-host-mcu.sh
 echo "... finished klipper host mcu build"
 echo ""
 
-# TODO build chelper
+echo "Starting c_helper build ..."
+klipper/c_helper/build-chelper.sh
+echo "... finished c_helper build"
+echo ""
 
 echo "Finished"
 echo ""

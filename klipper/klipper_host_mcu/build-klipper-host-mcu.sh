@@ -6,11 +6,13 @@ SCRIPT_DIR="$(dirname "$0")"
 cd "$SCRIPT_DIR"
 SCRIPT_DIR="$(pwd)"
 
-# echo "SCRIPT_DIR: $SCRIPT_DIR"
-KLIPPER_DIR="$(cd "${SCRIPT_DIR}/../../../klipper" && pwd)"
-# echo "KLIPPER_DIR: $KLIPPER_DIR"
+# Repo root is two levels up from klipper/klipper_host_mcu; klipper submodule + toolchain live under it.
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+KLIPPER_DIR="${REPO_ROOT}/external/klipper"
 
-TC="$(cd ../../../mips-toolchain/mips32r5el--glibc--bleeding-edge-2018.11-1 && pwd)"
+# In the container image CROSS_TOOLCHAIN points at the crosstool-ng install; otherwise
+# fall back to a toolchain checked out under the repo.
+TC="${CROSS_TOOLCHAIN:-${REPO_ROOT}/toolchain/mips32r5el--glibc--bleeding-edge-2018.11-1}"
 echo "TC: $TC"
 
 if [ ! -e "${TC}/bin/mipsel-buildroot-linux-gnu-gcc" ]; then
@@ -23,8 +25,8 @@ export CROSS_PREFIX="${TC}/bin/mipsel-buildroot-linux-gnu-"
 
 pushd "$KLIPPER_DIR" >/dev/null
 make clean KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config" >/dev/null
-# set Linux / Linux process
-make menuconfig KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config"
+# Linux process MCU; olddefconfig keeps it non-interactive (config already sets MACH_LINUX)
+make olddefconfig KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config"
 make -j$(nproc) KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config" >/dev/null
 popd >/dev/null
 
