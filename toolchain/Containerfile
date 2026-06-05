@@ -43,7 +43,7 @@ RUN groupadd -g 1000 ct && useradd -m -u 1000 -g 1000 ct \
  && mkdir -p /opt/x-tools /home/ct/src /home/ct/.ccache /home/ct/build /opt/ctng-cfg \
  && chown -R ct:ct /opt/x-tools /home/ct
 COPY crosstool-ng.fragment /opt/ctng-cfg/crosstool-ng.fragment
-COPY ct-build.sh /usr/local/bin/ct-build
+COPY ct_build.py /usr/local/bin/ct-build
 RUN chmod +x /usr/local/bin/ct-build
 # Lower glibc's MIPS nan2008 minimum-kernel floor (4.5.0 -> 4.4.0) to match the device's
 # Ingenic 4.4.94 kernel; ct-ng auto-applies bundled patches from this dir.
@@ -57,7 +57,7 @@ WORKDIR /home/ct/build
 # and the produced ABI (must emit the device's ld-linux-mipsn8.so.1) and fails the build if not.
 RUN --mount=type=cache,target=/home/ct/src,uid=1000,gid=1000 \
     --mount=type=cache,target=/home/ct/.ccache,uid=1000,gid=1000 \
-    ct-build
+    ct-build all
 
 USER root
 ENV CROSS_TOOLCHAIN=/opt/x-tools/mipsel-buildroot-linux-gnu
