@@ -14,7 +14,7 @@ export SYSROOT=${TOOLCHAIN}/mipsel-buildroot-linux-gnu/sysroot
 export PATH="$TOOLCHAIN/bin:$PATH"
 
 if [ ! -x "${TOOLCHAIN}/bin/mipsel-buildroot-linux-gnu-gcc" ]; then
-  echo "MIPS toolchain missing at ${TOOLCHAIN}. Build via toolchain/build-image.sh and run through build-in-container.sh, or set CROSS_TOOLCHAIN." >&2
+  echo "MIPS toolchain missing at ${TOOLCHAIN}. Build via tools/build.py image && tools/build.py artifacts, or set CROSS_TOOLCHAIN." >&2
   exit 2
 fi
 

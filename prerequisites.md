@@ -16,11 +16,12 @@ This is tested on ubuntu linux.
 The MIPS cross toolchain (host MCU + c_helper.so) and the arm-none-eabi MCU toolchain are
 built from source via crosstool-ng inside a container — pinned to the device ABI
 (glibc 2.29 · kernel 4.4 · mipsel · mips32r2 · o32 · hard-float · fp64 · nan2008). Needs only
-podman on the build host (the rest is in the image):
+podman + python3 on the build host (the rest is in the image):
 
-    $ ./toolchain/build-image.sh         # ~20-40 min first time: bakes the toolchain into the image
-    $ ./toolchain/snapshot-toolchain.sh  # optional: back the toolchain up to a named volume (dev safety net)
-    $ ./build-in-container.sh            # build all device artifacts using the image
+    $ ./tools/build.py image       # ~20-40 min first time: bakes the toolchain into the image
+    $ ./tools/build.py snapshot    # optional: back the toolchain up to a named volume (dev safety net)
+    $ ./tools/build.py artifacts   # build all device artifacts using the image + verify ABI
+    # ...or ./tools/build.py all    (image + artifacts)
 
 The toolchain is baked into the image (self-contained / distributable); build-time cache mounts
 make rebuilds cheap, and the snapshot volume preserves a known-good toolchain across image

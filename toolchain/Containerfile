@@ -5,9 +5,9 @@
 # downloads and object files (ccache) across rebuilds so iterating is cheap. Reproducibility
 # comes from crosstool-ng's pinned component versions + checksums, so the base is not pinned.
 #
-# Build:   ./toolchain/build-image.sh        (builds image incl. toolchain; ~20-40 min first time)
-# Backup:  ./toolchain/snapshot-toolchain.sh (copy toolchain -> named volume, dev safety net)
-# Use:     ../build-in-container.sh           (build device artifacts with this image)
+# Build:   ./tools/build.py image       (builds image incl. toolchain; ~20-40 min first time)
+# Backup:  ./tools/build.py snapshot    (copy toolchain -> named volume, dev safety net)
+# Use:     ./tools/build.py artifacts   (build device artifacts with this image)
 FROM opensuse/tumbleweed:latest
 
 # Host build deps for crosstool-ng + glibc/gcc, ccache for fast rebuilds, and arm bare-metal
