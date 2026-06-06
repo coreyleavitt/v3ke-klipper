@@ -1,0 +1,24 @@
+# arm-none-eabi bare-metal toolchain for the GD32F303 / STM32F103 (Cortex-M3) motion MCU.
+#
+# Bare metal => there is NO device libc to match: musl/uClibc/glibc are all Linux C libraries
+# (syscall wrappers) and don't apply with no kernel. The bare-metal C library is newlib (what the
+# arm-none-eabi sample builds), and Klipper's firmware is largely freestanding (mostly libgcc +
+# a little newlib). So unlike the MIPS side there's no ABI to pin to a device — this toolchain is
+# pinned purely for REPRODUCIBILITY, replacing the distro cross-arm package (un-pinnable on a
+# rolling distro). gcc 14 matches the distro arm-none-eabi we used before; Klipper supplies its
+# own -mcpu=cortex-m3 -mthumb, so the toolchain stays generic + multilib (rmprofile) + soft-float.
+
+CT_GCC_V_14=y
+
+# Only build Cortex-M/R (rmprofile) multilibs — we have a Cortex-M3; drop the Cortex-A (aprofile)
+# variants the distro shipped but we'll never use. Halves the multilib runtime build.
+CT_CC_GCC_MULTILIB_LIST="rmprofile"
+
+# install + trim + cache (same conventions as the MIPS fragment)
+CT_PREFIX_DIR="/opt/x-tools/${CT_TARGET}"
+# CT_DEBUG_GDB is not set
+# CT_DEBUG_DUMA is not set
+# CT_DEBUG_STRACE is not set
+# CT_DEBUG_LTRACE is not set
+CT_LOCAL_TARBALLS_DIR="/home/ct/src"
+CT_SAVE_TARBALLS=y

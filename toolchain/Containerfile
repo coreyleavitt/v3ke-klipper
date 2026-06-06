@@ -10,8 +10,9 @@
 # Use:     ./tools/build.py artifacts   (build device artifacts with this image)
 FROM opensuse/tumbleweed:latest
 
-# Host build deps for crosstool-ng + glibc/gcc, ccache for fast rebuilds, and arm bare-metal
-# for the STM32/GD32 MCU firmware.
+# Host build deps for crosstool-ng + glibc/gcc + ccache. Both target toolchains (MIPS host and
+# arm-none-eabi for the MCU firmware) are built from source by ct-build below — no distro cross
+# packages (they can't be durably pinned on a rolling distro).
 # `dup` first: a rolling base image can be a newer snapshot than the current repo mirror, which
 # breaks devel/runtime version matches (e.g. ncurses-devel vs libncurses6). dup reconciles to one
 # consistent snapshot before installing.
@@ -22,7 +23,6 @@ RUN zypper -n --gpg-auto-import-keys refresh \
       bison flex texinfo help2man gperf ncurses-devel ccache \
       curl wget tar xz bzip2 gzip unzip which findutils file gawk sed rsync python3 git \
       glibc-devel \
-      cross-arm-none-gcc14 cross-arm-none-newlib-devel \
  && zypper clean -a
 
 # --- crosstool-ng (pinned release, checksum-verified) ---
@@ -42,24 +42,33 @@ ENV PATH=/opt/ctng/bin:$PATH
 RUN groupadd -g 1000 ct && useradd -m -u 1000 -g 1000 ct \
  && mkdir -p /opt/x-tools /home/ct/src /home/ct/.ccache /home/ct/build /opt/ctng-cfg \
  && chown -R ct:ct /opt/x-tools /home/ct
-COPY crosstool-ng.fragment /opt/ctng-cfg/crosstool-ng.fragment
 COPY ct_build.py /usr/local/bin/ct-build
 RUN chmod +x /usr/local/bin/ct-build
+COPY crosstool-ng.fragment /opt/ctng-cfg/crosstool-ng.fragment
 # Lower glibc's MIPS nan2008 minimum-kernel floor (4.5.0 -> 4.4.0) to match the device's
 # Ingenic 4.4.94 kernel; ct-ng auto-applies bundled patches from this dir.
 COPY glibc-patches/0100-mips-nan2008-min-kernel-4.4.patch \
      /opt/ctng/share/crosstool-ng/packages/glibc/2.29/
 
 USER ct
-WORKDIR /home/ct/build
-# Build the toolchain into the image. Cache mounts (downloads + ccache) persist across image
-# builds so re-runs don't re-download and recompile from scratch. ct-build validates the config
-# and the produced ABI (must emit the device's ld-linux-mipsn8.so.1) and fails the build if not.
+WORKDIR /home/ct
+# Two toolchains, two layers (cache mounts persist downloads + ccache across rebuilds, so re-runs
+# don't re-download/recompile). ct-build validates each (mips: the device loader; arm: a Cortex-M3
+# object) and fails the build if not.
+#
+# 1) MIPS host toolchain (device ABI). The slow one.
 RUN --mount=type=cache,target=/home/ct/src,uid=1000,gid=1000 \
     --mount=type=cache,target=/home/ct/.ccache,uid=1000,gid=1000 \
-    ct-build all
+    ct-build all --target mips
+# 2) arm-none-eabi bare-metal toolchain (newlib) for the MCU firmware, replacing the un-pinnable
+#    distro arm package. Its fragment is COPY'd HERE — after the MIPS layer — so iterating the ARM
+#    config doesn't invalidate and rebuild the (cached) MIPS toolchain above.
+COPY crosstool-ng-arm.fragment /opt/ctng-cfg/crosstool-ng-arm.fragment
+RUN --mount=type=cache,target=/home/ct/src,uid=1000,gid=1000 \
+    --mount=type=cache,target=/home/ct/.ccache,uid=1000,gid=1000 \
+    ct-build all --target arm
 
 USER root
 ENV CROSS_TOOLCHAIN=/opt/x-tools/mipsel-buildroot-linux-gnu
-ENV PATH=/opt/x-tools/mipsel-buildroot-linux-gnu/bin:/opt/ctng/bin:$PATH
+ENV PATH=/opt/x-tools/mipsel-buildroot-linux-gnu/bin:/opt/x-tools/arm-none-eabi/bin:/opt/ctng/bin:$PATH
 WORKDIR /work
