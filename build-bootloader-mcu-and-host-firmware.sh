@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SCRIPT_DIR="$(cd . && pwd)"
+SCRIPT_DIR="$(pwd)"   # already cd'd to the script dir above
 # klipper/katapult are vendored as submodules under external/ (see external/ + .gitmodules)
 KATAPULT_ROOT_DIR="$(cd external/katapult && pwd)"
 KATAPULT_CONFIG="$(cd mcu-firmware/ && pwd)/katapult.config"
@@ -17,7 +17,7 @@ if [ ! -d "$KATAPULT_ROOT_DIR" ]; then
   exit 2
 fi
 if [ ! -f "$KATAPULT_CONFIG" ]; then
-  echo "KATAPULT_CONFIG: $KATAPULT_ROOT_DIR is not a file! ABORTING"
+  echo "KATAPULT_CONFIG: $KATAPULT_CONFIG is not a file! ABORTING"
   exit 3
 fi
 if [ ! -d "$KLIPPER_ROOT_DIR" ]; then
@@ -30,23 +30,27 @@ if [ ! -f "$KLIPPER_CONFIG" ]; then
 fi
 
 echo ""
+# Subshells (not pushd/popd): under `set -e` a failed make exits the subshell and propagates,
+# without leaving the directory stack dirty. Paths are absolute, so cwd inside doesn't matter.
 echo "Starting katapult build ..."
-pushd "$KATAPULT_ROOT_DIR" >/dev/null
-make clean KCONFIG_CONFIG="$KATAPULT_CONFIG" >/dev/null
-make olddefconfig KCONFIG_CONFIG="$KATAPULT_CONFIG"
-make -j$(nproc) KCONFIG_CONFIG="$KATAPULT_CONFIG" >/dev/null
-cp -v "${KATAPULT_ROOT_DIR}"/out/katapult.* "${SCRIPT_DIR}/mcu-firmware"
-popd >/dev/null
+(
+  cd "$KATAPULT_ROOT_DIR"
+  make clean KCONFIG_CONFIG="$KATAPULT_CONFIG" >/dev/null
+  make olddefconfig KCONFIG_CONFIG="$KATAPULT_CONFIG"
+  make -j"$(nproc)" KCONFIG_CONFIG="$KATAPULT_CONFIG" >/dev/null
+  cp -v "${KATAPULT_ROOT_DIR}"/out/katapult.* "${SCRIPT_DIR}/mcu-firmware"
+)
 echo "... finished katapult build"
 echo ""
 
 echo "Starting klipper build ..."
-pushd "$KLIPPER_ROOT_DIR" >/dev/null
-make clean KCONFIG_CONFIG="$KLIPPER_CONFIG" >/dev/null
-make olddefconfig KCONFIG_CONFIG="$KLIPPER_CONFIG"
-make -j$(nproc) KCONFIG_CONFIG="$KLIPPER_CONFIG" >/dev/null
-cp -v "${KLIPPER_ROOT_DIR}"/out/klipper.* "${SCRIPT_DIR}/mcu-firmware"
-popd >/dev/null
+(
+  cd "$KLIPPER_ROOT_DIR"
+  make clean KCONFIG_CONFIG="$KLIPPER_CONFIG" >/dev/null
+  make olddefconfig KCONFIG_CONFIG="$KLIPPER_CONFIG"
+  make -j"$(nproc)" KCONFIG_CONFIG="$KLIPPER_CONFIG" >/dev/null
+  cp -v "${KLIPPER_ROOT_DIR}"/out/klipper.* "${SCRIPT_DIR}/mcu-firmware"
+)
 echo "... finished klipper build"
 echo ""
 

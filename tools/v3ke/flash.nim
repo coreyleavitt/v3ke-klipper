@@ -11,28 +11,44 @@ const
   KatapultAddr     = 0x0800_0000                   # bootloader
   KlipperAddr      = 0x0800_2000                   # after the 8 KiB bootloader
   FlashSize        = 0x0008_0000                   # 512 KiB
+  AdapterKHz       = 100                            # conservative SWD speed — reliable on long wiring
 
 proc fwDir(): string = getEnv("FW_DIR", "mcu-firmware")
 
 proc ocd(script: string): string =
-  ## Run openocd with our interface+target + a -c command script. No shell => no quoting bugs;
-  ## non-zero exit raises instead of silently continuing.
+  ## Run openocd with our interface+target + a -c command script. No shell => no shell-quoting bugs.
+  ## A consistent conservative adapter speed is prepended to every script (a fast default can
+  ## silently corrupt reads/writes on long SWD wiring). Non-zero exit raises.
   let iface = getEnv("V3KE_INTERFACE", DefaultInterface)
+  if not iface.endsWith(".cfg"):
+    fail(&"V3KE_INTERFACE must name an openocd interface .cfg (got: {iface})")
+  let full = &"adapter speed {AdapterKHz}; " & script
   let p = startProcess("openocd",
-    args = @["-f", iface, "-f", Target, "-c", script],
+    args = @["-f", iface, "-f", Target, "-c", full],
     options = {poUsePath, poStdErrToStdOut})
   result = p.outputStream.readAll()
   let code = p.waitForExit()
   p.close()
   if code != 0: fail(&"openocd exited {code}:\n{result}")
 
+proc checkOcdPath(p: string) =
+  ## openocd `-c` scripts are Tcl. Brace-quoting (below) handles spaces, but a `{`/`}` in the path
+  ## would close the brace group and inject Tcl that openocd executes locally. These are firmware
+  ## file paths — reject Tcl-significant characters rather than ship a full Tcl escaper.
+  for c in p:
+    if c in {'{', '}', '[', ']', '$', '\\', ';', '"', '\n', '\r'}:
+      fail(&"unsafe character in openocd path (rejected): {p}")
+
 proc confirm(msg: string) =
   stdout.styledWrite(fgYellow, msg & " [y/N] ")
-  if stdin.readLine().strip().toLowerAscii() notin ["y", "yes"]: fail("aborted by user")
+  stdout.flushFile()          # partial line (no newline) won't show until flushed; user types blind otherwise
+  if stdin.readLine().strip().toLowerAscii() notin ["y", "yes"]: abort("aborted by user")
 
 proc backupStock(outPath: string) =
+  checkOcdPath(outPath)
   note(&"Backing up stock firmware -> {outPath}")
-  discard ocd(&"init; halt; dump_image {outPath} 0x{FlashBase:x} 0x{FlashSize:x}; exit")
+  # Tcl-brace-quote paths in the -c script so a path with spaces can't word-split inside openocd.
+  discard ocd(&"init; halt; dump_image {{{outPath}}} 0x{FlashBase:x} 0x{FlashSize:x}; exit")
   if not fileExists(outPath) or getFileSize(outPath) == 0:
     fail("empty dump — readout protection (RDP) likely enabled")
   let data = readFile(outPath)
@@ -40,14 +56,16 @@ proc backupStock(outPath: string) =
   else: ok(&"backed up {data.len} bytes (not blank)")
 
 proc flashOne(name, path: string; address: int) =
+  checkOcdPath(path)
   if not fileExists(path): fail(&"missing {name} image: {path}")
   let want = readFile(path)
   note(&"Flashing {name}: {path} ({want.len} B) -> 0x{address:x}")
-  discard ocd(&"init; reset halt; flash write_image erase {path} 0x{address:x}; " &
-              &"verify_image {path} 0x{address:x}; reset run; exit")
+  discard ocd(&"init; reset halt; flash write_image erase {{{path}}} 0x{address:x}; " &
+              &"verify_image {{{path}}} 0x{address:x}; reset run; exit")
   # Belt-and-suspenders beyond verify_image: read the region back and byte-compare.
   let tmp = getTempDir() / &"v3ke-{name}.readback"
-  discard ocd(&"init; halt; dump_image {tmp} 0x{address:x} 0x{want.len:x}; exit")
+  checkOcdPath(tmp)
+  discard ocd(&"init; halt; dump_image {{{tmp}}} 0x{address:x} 0x{want.len:x}; exit")
   let got = readFile(tmp)
   removeFile(tmp)
   if got != want: fail(&"{name} read-back MISMATCH ({got.len} vs {want.len} B)")
@@ -55,7 +73,10 @@ proc flashOne(name, path: string; address: int) =
 
 proc eraseAll() =
   note("Erasing chip...")
-  discard ocd(&"adapter speed 100; init; halt; reset halt; " &
+  # Two erase_address calls split the 512 KiB (0x60000 + 0x20000 = FlashSize) — the GD32 reports a
+  # non-uniform sector layout and a single full-range erase can fail on the boundary. Speed is set
+  # centrally in ocd().
+  discard ocd(&"init; halt; reset halt; " &
               &"flash erase_address 0x{FlashBase:x} 0x60000; " &
               &"flash erase_address 0x{FlashBase + 0x60000:x} 0x20000; exit")
 

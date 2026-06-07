@@ -1,7 +1,7 @@
 ## v3ke — Ender 3 V3 KE mainline toolkit (hardware side). Single static binary.
 ## Build:  nim c -d:release --opt:size -o:v3ke tools/v3ke/v3ke.nim
 import std/os
-import common, flash, verify, deploy, rollout
+import common, flash, verify, deploy, rollout, version
 
 proc usage() =
   echo """v3ke — Ender 3 V3 KE mainline toolkit (hardware side)
@@ -24,6 +24,9 @@ usage:
         Switch to mainline: verify -> deploy -> flash (with gates). The final live-system
         swap stays manual per DEPLOY.md.
 
+  v3ke version (or --version / -v)
+        Print the build version and exit.
+
   v3ke help
 """
 
@@ -36,8 +39,11 @@ when isMainModule:
     of "deploy":  quit(deployCmd(args[1 .. ^1]))
     of "flash":   quit(flashCmd(args[1 .. ^1]))
     of "rollout": quit(rolloutCmd(args[1 .. ^1]))
+    of "version", "--version", "-v": echo "v3ke " & version(); quit(0)
     of "help", "-h", "--help": usage(); quit(0)
     else:
       errln("unknown command: " & args[0]); usage(); quit(1)
+  except UserAbort as e:
+    note(e.msg); quit(130)        # user declined — a clean stop, not a failure
   except V3keError as e:
     errln(e.msg); quit(1)

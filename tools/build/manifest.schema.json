@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/coreyleavitt/ender3-v3-ke-klipper-mainline/tools/build/manifest.schema.json",
+  "title": "v3ke build manifest",
+  "description": "Build-provenance attestation produced by 'build.py release'.",
+  "type": "object",
+  "required": ["_type", "schema_version", "build", "sources", "artifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "_type": {
+      "const": "v3ke-build"
+    },
+    "schema_version": {
+      "const": "1"
+    },
+    "build": {
+      "type": "object",
+      "required": ["id", "commit", "timestamp", "reproducible", "toolchain"],
+      "additionalProperties": false,
+      "properties": {
+        "id":           { "type": "string", "minLength": 1 },
+        "commit":       { "type": "string", "minLength": 1 },
+        "timestamp":    { "type": "string", "minLength": 1 },
+        "reproducible": { "type": "boolean" },
+        "toolchain": {
+          "type": "object",
+          "required": ["mips", "arm"],
+          "additionalProperties": false,
+          "properties": {
+            "mips": {
+              "type": "object",
+              "required": ["glibc", "gcc", "binutils", "linux", "glibc_min_kernel"],
+              "additionalProperties": true,
+              "properties": {
+                "glibc":            { "type": "string" },
+                "gcc":              { "type": "string" },
+                "binutils":         { "type": "string" },
+                "linux":            { "type": "string" },
+                "glibc_min_kernel": { "type": "string" }
+              }
+            },
+            "arm": {
+              "type": "object",
+              "required": ["gcc"],
+              "additionalProperties": true,
+              "properties": {
+                "gcc": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "sources": {
+      "type": "object",
+      "required": ["klipper", "katapult", "mainsail-config"],
+      "additionalProperties": false,
+      "properties": {
+        "klipper":        { "$ref": "#/$defs/source_entry" },
+        "katapult":       { "$ref": "#/$defs/source_entry" },
+        "mainsail-config": { "$ref": "#/$defs/source_entry" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "sha256", "size"],
+        "additionalProperties": false,
+        "properties": {
+          "name":   { "type": "string", "minLength": 1 },
+          "path":   { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "size":   { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "source_entry": {
+      "type": "object",
+      "required": ["url", "commit"],
+      "additionalProperties": false,
+      "properties": {
+        "url":    { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

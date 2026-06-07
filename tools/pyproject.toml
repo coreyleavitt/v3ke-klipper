@@ -1,0 +1,26 @@
+[project]
+name = "v3ke-build"
+version = "0.0.0"
+description = "Host-side build & release tooling for the Ender 3 V3 KE mainline Klipper port."
+requires-python = ">=3.11"
+dependencies = []
+
+# Dev/test dependencies (PEP 735 dependency-groups). `uv run` syncs these automatically.
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "check-jsonschema>=0.29",
+  "pyyaml>=6",
+]
+
+# Pure tooling + tests, not a distributable package — no build backend needed.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]   # tools/ on sys.path so `import build.elf` (added in A1) resolves
+addopts = "-ra"
+markers = [
+  "integration: needs the cross-toolchain container or real built artifacts; deselect with -m 'not integration'",
+]

@@ -46,7 +46,7 @@ TARGETS = {
         sample="arm-none-eabi",
         fragment="/opt/ctng-cfg/crosstool-ng-arm.fragment",
         strip=ARM_STRIP,
-        expect={"CT_GCC_VERSION": "14.3.0"},
+        expect={"CT_GCC_VERSION": "14.3.0", "CT_CC_GCC_MULTILIB_LIST": "rmprofile"},
         gcc="/opt/x-tools/arm-none-eabi/bin/arm-none-eabi-gcc",
         verify="armobj",
         post="nanomerge",
@@ -82,7 +82,8 @@ def host_env(args):
     env["CCACHE_DIR"] = args.ccache_dir
     env["PATH"] = f"/usr/lib64/ccache:{bind}:{env['PATH']}"
     Path(args.ccache_dir).mkdir(parents=True, exist_ok=True)
-    subprocess.run(["ccache", "-M", args.ccache_size], env=env, check=False)
+    if subprocess.run(["ccache", "-M", args.ccache_size], env=env).returncode != 0:
+        print(f"[{args.target}] warning: `ccache -M {args.ccache_size}` failed; building without a resized cache")
     return env
 
 
@@ -147,7 +148,7 @@ def verify(args, spec):
                 interp = next((l.strip() for l in rl.splitlines() if "interpreter" in l), "?")
                 sys.exit(f"LOADER MISMATCH (default ABI is not nan2008/fp64): {interp}")
             print(f"[mips] toolchain OK -> default loader {DEVICE_LOADER}")
-        else:  # armobj — bare metal, no loader; confirm it builds a Cortex-M3 ARM object
+        elif spec["verify"] == "armobj":  # bare metal, no loader; confirm it builds a Cortex-M3 object
             obj = Path(d) / "t.o"
             src.write_text("int f(int x){return x*x;}\n")
             run([gcc, "-mcpu=cortex-m3", "-mthumb", "-Os", "-c", str(src), "-o", str(obj)])
@@ -155,6 +156,41 @@ def verify(args, spec):
             if "ARM" not in mach:
                 sys.exit("verify failed: object is not ARM")
             print("[arm] toolchain OK -> compiles Cortex-M3 Thumb objects")
+        else:
+            sys.exit(f"unknown verify mode: {spec['verify']!r}")
+
+
+def emit_versions() -> dict:
+    """Return a dict of pinned toolchain component versions for all targets.
+
+    Reads directly from the TARGETS dict — no toolchain invocation required.
+    Runs anywhere with python3 (stdlib-only), offline.
+
+    Returns
+    -------
+    dict
+        ``{"mips": {"glibc": "2.29", "gcc": "8.5.0", ...},
+            "arm":  {"gcc": "14.3.0", ...}}``
+
+    The mips entry includes: glibc, gcc, binutils, linux, glibc_min_kernel, arch, float.
+    The arm entry includes: gcc.
+    """
+    mips = TARGETS["mips"]["expect"]
+    arm  = TARGETS["arm"]["expect"]
+    return {
+        "mips": {
+            "glibc":            mips["CT_GLIBC_VERSION"],
+            "gcc":              mips["CT_GCC_VERSION"],
+            "binutils":         mips["CT_BINUTILS_VERSION"],
+            "linux":            mips["CT_LINUX_VERSION"],
+            "glibc_min_kernel": mips["CT_GLIBC_MIN_KERNEL"],
+            "arch":             mips["CT_ARCH_ARCH"],
+            "float":            mips["CT_ARCH_FLOAT"],
+        },
+        "arm": {
+            "gcc": arm["CT_GCC_VERSION"],
+        },
+    }
 
 
 def main():
@@ -172,8 +208,13 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("configure", "build", "verify", "all"):
         sub.add_parser(name, parents=[base])
+    sub.add_parser("emit-versions", help="print pinned toolchain versions as JSON (no toolchain required)")
 
     args = p.parse_args()
+    if args.cmd == "emit-versions":
+        import json as _json
+        print(_json.dumps(emit_versions(), indent=2))
+        return
     spec = TARGETS[args.target]
     if args.cmd in ("configure", "all"):
         configure(args, spec)

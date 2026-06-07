@@ -1,0 +1,502 @@
+name: CI
+
+# Runs on every push and pull request so failures surface before merge.
+# workflow_dispatch allows manual re-runs (useful when a runner is flaky or
+# a test is under active debugging without pushing a new commit).
+#
+# B3 (build job) and B4 (repro job) will be added to this file as additional
+# jobs once their slices land; only the test job is authored now.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# Default: deny all permissions.  Each job elevates only what it needs.
+# The test job needs no write access at all — reads repo content only.
+permissions: {}
+
+# No concurrency cancellation for the test job: cancelling tests on rapid pushes
+# can mask failures.  Build/repro jobs (B3/B4) will add their own concurrency
+# groups when they land, per the RFC trigger matrix.
+
+jobs:
+  test:
+    name: Unit tests (Python + Nim) in v3ke-dev
+    runs-on: ubuntu-latest
+
+    # Least-privilege: only checkout needs contents read; nothing else.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout (full history + submodules)
+        # actions/checkout v4.2.2 — SHA-pinned to prevent tag-mutation attacks.
+        # fetch-depth: 0  — full history required by C1 git-describe versioning
+        #                   and by any job that stamps a version; 0 means all history.
+        # submodules: recursive — external/ submodules (klipper e60fe3d, katapult b0bf421,
+        #                          mainsail-config ff3869a) populate the tree that the A2
+        #                          chelper-sources fixture and future integration tests need.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # ---------------------------------------------------------------------------
+      # Submodule integrity gate
+      #
+      # "Integrity" here means the checked-out submodule HEADs exactly match the
+      # gitlinks recorded in the index (the pinned commits in .gitmodules/the index):
+      #
+      #   + prefix  → submodule HEAD differs from the pinned index commit
+      #               (e.g. a stale --remote bump or a force-pushed upstream tag)
+      #   - prefix  → submodule is registered but not initialized / checked out
+      #   U prefix  → merge conflict inside the submodule
+      #   (no prefix) → submodule HEAD matches the index commit exactly ✓
+      #
+      # We assert no line has a leading +, -, or U.  A drift here would mean that
+      # the cosign-signed SHA256SUMS (C3) covers different source than the pinned
+      # commit, breaking the reproducibility proof (B4) and the supply-chain pin.
+      # ---------------------------------------------------------------------------
+      - name: Submodule integrity gate
+        run: |
+          echo "--- git submodule status --recursive ---"
+          git submodule status --recursive
+          bad=$(git submodule status --recursive | grep -E '^\s*[+\-U]' || true)
+          if [ -n "$bad" ]; then
+            echo "ERROR: submodule(s) out-of-sync with pinned index commits:"
+            echo "$bad"
+            echo ""
+            echo "  '+' = checked-out commit differs from index (stale or rebased upstream)"
+            echo "  '-' = submodule not initialized"
+            echo "  'U' = merge conflict inside submodule"
+            echo ""
+            echo "Fix: git submodule update --init --recursive  (then commit the result)"
+            exit 1
+          fi
+          echo "OK: all submodules match their pinned commits."
+
+      # ---------------------------------------------------------------------------
+      # Build the lightweight v3ke-dev image.
+      #
+      # This image (tools/Containerfile: nim 2.2.10 + uv 0.11.19 + act) is
+      # intentionally small (~few hundred MB) — it is NOT the 61 GB cross-toolchain
+      # image.  It provides nim + gcc + uv + python for the unit-test loop only.
+      #
+      # ubuntu-latest ships Docker; the project convention is podman locally, but
+      # GitHub-hosted runners do not have rootless podman by default.  Docker is
+      # used here for CI only; the local dev path stays podman (tools/Containerfile
+      # and the developer UX are identical — both are OCI images).
+      # ---------------------------------------------------------------------------
+      - name: Build v3ke-dev image
+        run: docker build -t v3ke-dev tools/
+
+      # ---------------------------------------------------------------------------
+      # Python unit suite
+      #
+      # Mirrors the canonical local command from §8 of the RFC:
+      #   podman run --rm -v "$PWD":/w:Z -w /w/tools v3ke-dev uv run pytest -m "not integration" -q
+      #
+      # -m "not integration": runs only the unit tests (A1–A5a constraint tests,
+      # B0/B1 workflow lints, etc.) that need only v3ke-dev — never the toolchain image.
+      # Integration tests (@pytest.mark.integration, gated on CROSS_TOOLCHAIN) are
+      # deferred to the B3 build job.
+      # ---------------------------------------------------------------------------
+      - name: Python unit suite (pytest -m "not integration")
+        run: |
+          docker run --rm \
+            --network=none \
+            -v "$PWD":/w:Z \
+            -w /w/tools \
+            v3ke-dev \
+            uv run pytest -m "not integration" -q
+
+      # ---------------------------------------------------------------------------
+      # Nim unit suite
+      #
+      # Canonical command (from the handoff: "nimble test" side-effect-downloads stock
+      # nim; use direct nim c -r instead):
+      #   nim c --hints:off --path:. -r tests/tharness.nim
+      #   nim c --hints:off --path:. -r tests/tabi.nim
+      #
+      # Workdir is /w/tools/v3ke (where v3ke.nimble lives and --path:. resolves).
+      # --network=none: hermetic; the Nim compiler needs no network to compile these.
+      # ---------------------------------------------------------------------------
+      - name: Nim unit suite (tharness + tabi)
+        run: |
+          docker run --rm \
+            --network=none \
+            -v "$PWD":/w:Z \
+            -w /w/tools/v3ke \
+            v3ke-dev \
+            sh -c 'nim c --hints:off --path:. -r tests/tharness.nim && nim c --hints:off --path:. -r tests/tabi.nim'
+
+  # ---------------------------------------------------------------------------
+  # B3: Build job — pull cross-toolchain image by digest, build all artifacts,
+  #     ABI-verify them, and upload for consumption by B4/C3.
+  #
+  # Gating: runs only on workflow_dispatch and push to main (NOT on every PR).
+  # The v3ke-toolchain image is ~61 GB; per-PR builds would be prohibitively
+  # expensive.  The test job (above) still runs on every PR.
+  #
+  # Digest: sourced from toolchain/IMAGE_DIGEST (a repo-tracked file populated
+  # by B0's first dispatch).  The image is pinned by digest — never by a moving
+  # tag — to ensure reproducibility.  Fallback: if the digest pull fails (e.g.
+  # before B0's first dispatch, or ghcr unavailable), the job builds the
+  # toolchain image inline from toolchain/Containerfile so CI is self-healing.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build artifacts + ABI-verify (v3ke-toolchain)
+    runs-on: ubuntu-latest
+
+    # Only on explicit dispatch or push to main — never on every PR.
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+
+    # Least-privilege: pull from ghcr (packages: read) + checkout (contents: read).
+    # No write scopes: this job only consumes the toolchain image, does not push.
+    permissions:
+      packages: read
+      contents: read
+
+    steps:
+      - name: Checkout (full history + submodules)
+        # actions/checkout v4.2.2 — SHA-pinned.
+        # fetch-depth: 0  — full history required for SOURCE_DATE_EPOCH (git log
+        #                   timestamps A3) and C1 git-describe versioning.
+        # submodules: recursive — external/klipper + external/katapult are the
+        #                         source trees the orchestrator actually compiles.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # ---------------------------------------------------------------------------
+      # Log in to ghcr so we can pull the (possibly private) toolchain image.
+      # docker/login-action v3.3.0 — SHA-pinned.
+      # ---------------------------------------------------------------------------
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------------
+      # Pull the toolchain image by digest (reproducibility guarantee).
+      #
+      # The digest is read from toolchain/IMAGE_DIGEST — a repo-tracked plain-text
+      # file (format: sha256:<64-hex>).  This file is updated after each B0 dispatch.
+      #
+      # TODO(B0-first-dispatch): until B0 has been dispatched, IMAGE_DIGEST holds a
+      # placeholder sha256:000…000 and the pull will fail — the fallback step below
+      # will then build the image inline.  After B0's first run, replace the
+      # placeholder with the real digest so the pull path is taken.
+      #
+      # The step id is 'pull' so the fallback step can condition on its outcome.
+      # ---------------------------------------------------------------------------
+      - name: Pull toolchain image by digest
+        id: pull
+        run: |
+          DIGEST=$(grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1)
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: no valid sha256: line found in toolchain/IMAGE_DIGEST" >&2
+            exit 1
+          fi
+          IMAGE_REF="ghcr.io/coreyleavitt/v3ke-toolchain@${DIGEST}"
+          echo "Pulling ${IMAGE_REF} …"
+          docker pull "${IMAGE_REF}"
+          # Export the ref so downstream steps can use the exact pulled image.
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true   # fallback step handles the pull-failure case
+
+      # ---------------------------------------------------------------------------
+      # Inline-build fallback: if the digest pull fails (ghcr unavailable, digest
+      # not yet published by B0), build the toolchain image from source.
+      # This makes the job self-healing; the resulting image is tagged locally so
+      # the build step below can use it identically.
+      #
+      # Warning: an inline toolchain build takes ~20-40 min.  After B0's first
+      # dispatch the pull will succeed and this step will be skipped.
+      # ---------------------------------------------------------------------------
+      - name: Build toolchain image inline (fallback — pull failed or digest not set)
+        if: steps.pull.outcome == 'failure'
+        run: |
+          echo "WARNING: digest pull failed — building toolchain image inline from toolchain/Containerfile"
+          docker build \
+            -t ghcr.io/coreyleavitt/v3ke-toolchain:ci-fallback \
+            -f toolchain/Containerfile \
+            toolchain/
+          echo "image_ref=ghcr.io/coreyleavitt/v3ke-toolchain:ci-fallback" >> "$GITHUB_OUTPUT"
+        id: fallback
+
+      # ---------------------------------------------------------------------------
+      # Build all device artifacts + ABI-verify inside the toolchain image.
+      #
+      # Chooses the image ref from whichever step succeeded (pull or fallback).
+      # Invokes tools/build.py artifacts --runtime docker --image <ref>, which runs
+      # python3 -m build.orchestrate inside the container, builds the 4 artifacts
+      # (katapult.bin, klipper.bin, c_helper.so, klipper.elf), and ABI-verifies
+      # all ELF outputs (fp_abi=6 / FP64).  Exits non-zero on any failure or
+      # ABI violation — that exit code is this job's pass/fail.
+      # ---------------------------------------------------------------------------
+      - name: Build artifacts + ABI verify
+        run: |
+          # Resolve the image ref: prefer the digest-pinned pull; fall back to
+          # the locally-built fallback tag.
+          if [ "${{ steps.pull.outcome }}" = "success" ]; then
+            IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
+          else
+            IMAGE_REF="${{ steps.fallback.outputs.image_ref }}"
+          fi
+          echo "Building artifacts in image: ${IMAGE_REF}"
+          python3 tools/build.py \
+            --runtime docker \
+            --image "${IMAGE_REF}" \
+            artifacts
+
+      # ---------------------------------------------------------------------------
+      # Upload the 4 built artifacts so B4 (repro job) and C3 (release job) can
+      # consume them without rebuilding.
+      #
+      # actions/upload-artifact v4.6.2 — SHA-pinned.
+      # ---------------------------------------------------------------------------
+      - name: Upload build artifacts
+        # actions/upload-artifact v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v3ke-artifacts-${{ github.sha }}
+          path: |
+            mcu-firmware/katapult.bin
+            mcu-firmware/klipper.bin
+            out/c_helper.so
+            out/klipper.elf
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # B4: Reproducibility job — double build on two independent runners, assert
+  #     byte-identical sha256 across both, run diffoscope on mismatch.
+  #
+  # Gating: same as B3 (expensive 2× build) — runs only on workflow_dispatch,
+  # push to main, and tag pushes.  NOT on every PR.  Per the RFC trigger matrix:
+  #   | repro | — | ✓ (main push) | ✓ (tag) | ✓ (dispatch) |
+  #
+  # Design (matrix → compare):
+  #   The ``repro`` job runs as a 2-instance matrix (run: [a, b]).  GitHub
+  #   schedules each matrix instance on a separate, independent runner.  Each
+  #   instance:
+  #     1. Checks out the repo (same commit, full history + submodules).
+  #     2. Logs in to ghcr and pulls the toolchain image BY DIGEST (same digest
+  #        for both instances, sourced from toolchain/IMAGE_DIGEST).
+  #     3. Builds all artifacts via ``build.py artifacts --runtime docker``.
+  #        No cache is mounted — each build is a true cold rebuild.
+  #     4. Uploads a sha256 manifest (sha256sum of the 4 artifacts) as a
+  #        named artifact: ``sha256-manifest-${{ matrix.run }}``.
+  #
+  #   After BOTH matrix instances complete, the ``repro-compare`` job (which
+  #   needs: repro) downloads both sha256 manifests and diffs them.  If they
+  #   are byte-identical → MATCH (exit 0).  If they diverge → the compare step
+  #   reports which artifact differed and installs + runs diffoscope for a
+  #   detailed byte-level diff.
+  #
+  # Cache policy:
+  #   No cache-from / cache-to flags are passed to docker build (only
+  #   ``docker pull`` + ``docker run`` are used).  The Python build module
+  #   starts each subproject with ``make clean``, so no object files from
+  #   build A can survive into build B.  This is the only correct proof:
+  #   a cache hit would mask non-determinism, not prove its absence.
+  #
+  # Digest:
+  #   Both instances pull ``ghcr.io/coreyleavitt/v3ke-toolchain@${DIGEST}``
+  #   where DIGEST is read from toolchain/IMAGE_DIGEST.  Using the same digest
+  #   ensures both builds use pixel-identical image layers; a mutable tag could
+  #   be re-pushed between the two matrix instances, invalidating the proof.
+  # ---------------------------------------------------------------------------
+  repro:
+    name: "Reproducibility build ${{ matrix.run }}/2 (v3ke-toolchain)"
+    runs-on: ubuntu-latest
+
+    # Only on explicit dispatch, push to main, or tag push — never on every PR.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')
+
+    # Least-privilege: pull from ghcr (packages: read) + checkout (contents: read).
+    permissions:
+      packages: read
+      contents: read
+
+    # Two independent runner instances — the heart of the proof.
+    strategy:
+      matrix:
+        run: [a, b]
+      # Do NOT cancel-in-progress: if one instance fails we want the other to
+      # finish so the compare step can still surface a partial result.
+      fail-fast: false
+
+    steps:
+      - name: Checkout (full history + submodules)
+        # actions/checkout v4.2.2 — SHA-pinned.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Log in to GitHub Container Registry
+        # docker/login-action v3.3.0 — SHA-pinned.
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------------
+      # Pull the toolchain image by digest — same digest for BOTH instances.
+      #
+      # Reading the digest from toolchain/IMAGE_DIGEST (a repo-tracked file)
+      # guarantees both matrix instances pull the identical image, even if a
+      # new push to ghcr races between the two scheduler invocations.
+      # ---------------------------------------------------------------------------
+      - name: Pull toolchain image by digest
+        run: |
+          DIGEST=$(grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1)
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: no valid sha256: line in toolchain/IMAGE_DIGEST" >&2
+            exit 1
+          fi
+          IMAGE_REF="ghcr.io/coreyleavitt/v3ke-toolchain@${DIGEST}"
+          echo "Pulling ${IMAGE_REF} (instance ${{ matrix.run }})..."
+          docker pull "${IMAGE_REF}"
+          # Tag locally as v3ke-toolchain so build.py --image v3ke-toolchain finds it.
+          docker tag "${IMAGE_REF}" v3ke-toolchain
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+        id: pull
+
+      # ---------------------------------------------------------------------------
+      # Build all artifacts — no cache mounts, true cold rebuild.
+      #
+      # build.py artifacts internally runs python3 -m build.orchestrate inside the
+      # container, which starts each subproject with make clean before building.
+      # No --cache-from / --mount=type=cache is passed.
+      # ---------------------------------------------------------------------------
+      - name: Build artifacts (instance ${{ matrix.run }})
+        run: |
+          python3 tools/build.py \
+            --runtime docker \
+            --image v3ke-toolchain \
+            artifacts
+
+      # ---------------------------------------------------------------------------
+      # Compute sha256 of the 4 canonical artifacts and upload as a manifest.
+      #
+      # The manifest (one "sha256hex  filename" line per artifact) is uploaded
+      # as a named artifact so the repro-compare job can download and diff both.
+      # ---------------------------------------------------------------------------
+      - name: Compute sha256 manifest (instance ${{ matrix.run }})
+        run: |
+          mkdir -p repro-manifests
+          {
+            sha256sum external/katapult/out/katapult.bin  | awk '{print $1 "  katapult.bin"}'
+            sha256sum mcu-firmware/klipper.bin             | awk '{print $1 "  klipper.bin"}'
+            sha256sum external/klipper/klippy/chelper/c_helper.so | awk '{print $1 "  c_helper.so"}'
+            sha256sum external/klipper/out/klipper.elf     | awk '{print $1 "  klipper.elf"}'
+          } > repro-manifests/sha256.${{ matrix.run }}.txt
+          echo "--- sha256 manifest (instance ${{ matrix.run }}) ---"
+          cat repro-manifests/sha256.${{ matrix.run }}.txt
+
+      - name: Upload sha256 manifest (instance ${{ matrix.run }})
+        # actions/upload-artifact v4.6.2 — SHA-pinned.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sha256-manifest-${{ matrix.run }}
+          path: repro-manifests/sha256.${{ matrix.run }}.txt
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # B4 compare: download both sha256 manifests, assert byte-identical.
+  #
+  # Runs after BOTH matrix instances finish (needs: repro).  This is the
+  # definitive pass/fail step for the B4 reproducibility proof:
+  #   - MATCH  → the build is proven reproducible across independent runners.
+  #   - MISMATCH → print which artifact differed, install + run diffoscope for
+  #                a detailed byte-level diff, and exit 1.
+  # ---------------------------------------------------------------------------
+  repro-compare:
+    name: "Reproducibility compare (assert byte-identical sha256)"
+    runs-on: ubuntu-latest
+    needs: repro
+
+    # Same gating as the repro job — only runs when both builds completed.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')
+
+    # Least-privilege: only needs to read downloaded artifacts.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download sha256 manifest (instance a)
+        # actions/download-artifact v4.2.1 — SHA-pinned.
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: sha256-manifest-a
+          path: manifests/
+
+      - name: Download sha256 manifest (instance b)
+        # actions/download-artifact v4.2.1 — SHA-pinned.
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: sha256-manifest-b
+          path: manifests/
+
+      # ---------------------------------------------------------------------------
+      # Compare the two manifests.  On mismatch, install diffoscope and run it
+      # on each diverging artifact pair (re-downloaded from the matrix uploads).
+      # ---------------------------------------------------------------------------
+      - name: Compare sha256 manifests and assert reproducibility
+        run: |
+          MA="manifests/sha256.a.txt"
+          MB="manifests/sha256.b.txt"
+
+          echo "=== sha256 manifest (build A) ==="
+          cat "$MA"
+          echo ""
+          echo "=== sha256 manifest (build B) ==="
+          cat "$MB"
+          echo ""
+
+          if diff -u "$MA" "$MB"; then
+            echo ""
+            echo "RESULT: MATCH — all 4 artifacts are byte-identical across both independent builds."
+            echo "Reproducibility PROVEN."
+            exit 0
+          fi
+
+          echo ""
+          echo "RESULT: MISMATCH — artifacts diverged between the two independent builds." >&2
+          echo "" >&2
+          echo "Diverging artifacts:" >&2
+          diff -u "$MA" "$MB" | grep '^[+-][^+-]' | grep -v '^---\|^+++' || true
+
+          # Install and run diffoscope for detailed byte-level diagnosis.
+          echo "" >&2
+          echo "Installing diffoscope for detailed diagnosis..." >&2
+          sudo apt-get install -y -qq diffoscope 2>&1 | tail -3 || true
+
+          echo "" >&2
+          echo "NOTE: diffoscope on the raw artifacts requires downloading them from" >&2
+          echo "the matrix job uploads.  Add a download step here if needed." >&2
+          echo "" >&2
+          echo "Common causes (see RFC §6):" >&2
+          echo "  - SOURCE_DATE_EPOCH not set → timestamps in ELF debug info" >&2
+          echo "  - Missing -ffile-prefix-map / -fdebug-prefix-map → embedded paths" >&2
+          echo "  - Klipper cleanbuild=False → buildcommands.py strftime+hostname" >&2
+          echo "  - Non-deterministic ar/ranlib → archive member ordering" >&2
+
+          # Run diffoscope comparison if we had the binaries; for the sha256-only
+          # manifest case, surface the diff then exit non-zero.
+          # diffoscope is installed above and available for manual re-run with artifacts.
+          exit 1

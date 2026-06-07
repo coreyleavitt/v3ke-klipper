@@ -16,9 +16,12 @@ verify_mips() {   # <file> [required-interpreter]
   echo "$f"
   echo "    Machine: $mach"
   echo "    Flags:   $flags"
-  echo "$mach"  | grep -qi 'mips'    || { echo "    !! not MIPS";    rc=1; }
-  echo "$flags" | grep -qi 'nan2008' || { echo "    !! not nan2008"; rc=1; }
-  echo "$flags" | grep -qiw 'o32'    || { echo "    !! not o32";     rc=1; }
+  # Keep these checks in lockstep with tools/v3ke/verify.nim (the operator-side checker) — incl.
+  # mips32r2: a wrong-ISA build must not pass the CI gate just because the loader/ABI bits match.
+  echo "$mach"  | grep -qi 'mips'      || { echo "    !! not MIPS";     rc=1; }
+  echo "$flags" | grep -qi 'nan2008'   || { echo "    !! not nan2008";  rc=1; }
+  echo "$flags" | grep -qiw 'o32'      || { echo "    !! not o32";      rc=1; }
+  echo "$flags" | grep -qiw 'mips32r2' || { echo "    !! not mips32r2"; rc=1; }
   if [ -n "$want" ]; then
     if readelf -l "$f" | grep -q "$want"; then
       echo "    Interp:  $want OK"
@@ -28,7 +31,7 @@ verify_mips() {   # <file> [required-interpreter]
   fi
 }
 
-echo "=== ABI verification (must match device: mipsel / nan2008 / o32, loader ld-linux-mipsn8.so.1) ==="
+echo "=== ABI verification (must match device: mipsel / nan2008 / o32 / mips32r2, loader ld-linux-mipsn8.so.1) ==="
 verify_mips klipper/c_helper/c_helper.so
 verify_mips klipper/klipper_host_mcu/klipper_mcu.elf ld-linux-mipsn8.so.1
 

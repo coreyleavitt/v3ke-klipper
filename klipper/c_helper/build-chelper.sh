@@ -4,21 +4,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Repo root is two levels up from klipper/c_helper. Toolchain and the klipper
-# submodule both live under the repo, so chelper and the host-mcu build agree.
-# In the container image CROSS_TOOLCHAIN points at the crosstool-ng install; otherwise
-# fall back to a toolchain checked out under the repo.
+# Repo root is two levels up from klipper/c_helper. The crosstool-ng install is mounted/baked at
+# CROSS_TOOLCHAIN by the container; tools/build.py sets it. Require it — there is no in-repo
+# fallback toolchain (the old Bootlin tarball is gone), so don't pretend one exists.
 REPO_ROOT="$(cd ../.. && pwd)"
-export TOOLCHAIN="${CROSS_TOOLCHAIN:-${REPO_ROOT}/toolchain/mips32r5el--glibc--bleeding-edge-2018.11-1}"
+export TOOLCHAIN="${CROSS_TOOLCHAIN:?CROSS_TOOLCHAIN not set — build via tools/build.py artifacts (it runs this in the container)}"
 export SYSROOT=${TOOLCHAIN}/mipsel-buildroot-linux-gnu/sysroot
 export PATH="$TOOLCHAIN/bin:$PATH"
 
-if [ ! -x "${TOOLCHAIN}/bin/mipsel-buildroot-linux-gnu-gcc" ]; then
-  echo "MIPS toolchain missing at ${TOOLCHAIN}. Build via tools/build.py image && tools/build.py artifacts, or set CROSS_TOOLCHAIN." >&2
+CC="${TOOLCHAIN}/bin/mipsel-buildroot-linux-gnu-gcc"
+if [ ! -x "$CC" ]; then
+  echo "MIPS gcc missing at ${CC}. Build via tools/build.py image && tools/build.py artifacts." >&2
   exit 2
 fi
-
-CC=$(ls "$TOOLCHAIN"/bin/*gcc | head -n1)
 echo "Using CC: $CC"
 echo ""
 
@@ -27,37 +25,57 @@ CHELPER_DIR="${REPO_ROOT}/external/klipper/klippy/chelper"
 echo -n "Building c_helper from klipper commit: "
 git -C "$CHELPER_DIR" rev-parse --short HEAD 2>/dev/null || echo "(git unavailable)"
 
-if [ -f ${CHELPER_DIR}/c_helper.so ]; then
+if [ -f "${CHELPER_DIR}/c_helper.so" ]; then
   echo -n "Remove old file: "
-  rm -v ${CHELPER_DIR}/c_helper.so
+  rm -v "${CHELPER_DIR}/c_helper.so"
 fi
 echo ""
 
+# Read the source list from klipper's chelper/__init__.py (SOURCE_FILES) at build time so it can't
+# silently drift from the pinned submodule when klipper is bumped. Parse with ast.literal_eval (not
+# a regex) so it's robust to quote style, line wrapping, or comments in the list. python3 is in the image.
+echo "Reading SOURCE_FILES from chelper/__init__.py ..."
+SRCS=$(cd "$CHELPER_DIR" && python3 - <<'PY'
+import ast
+tree = ast.parse(open("__init__.py").read())
+files = None
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "SOURCE_FILES" for t in node.targets):
+        files = ast.literal_eval(node.value)
+if not files:
+    raise SystemExit("SOURCE_FILES not found in chelper/__init__.py")
+print("\n".join(files))
+PY
+) || { echo "failed to read SOURCE_FILES from chelper/__init__.py" >&2; exit 6; }
+
+# Absolute source paths in an array (not word-splitting) so a space in the repo path stays safe.
+mapfile -t SRC_REL <<< "$SRCS"
+SRC_PATHS=()
+for f in "${SRC_REL[@]}"; do [ -n "$f" ] && SRC_PATHS+=("${CHELPER_DIR}/$f"); done
+if [ "${#SRC_PATHS[@]}" -eq 0 ]; then echo "empty SOURCE_FILES list" >&2; exit 6; fi
+echo "  ${#SRC_PATHS[@]} source files"
+
 echo "Building c_helper ..."
-# Source code file list is from: __init__.py, variable: SOURCE_FILES
 "$CC" --sysroot="$SYSROOT" \
   -shared -fPIC -O2 -Wall \
   -mips32r2 -mabi=32 -mhard-float -mfp64 \
   -mnan=2008 -Wa,-mnan=2008 \
-  -o ${CHELPER_DIR}/c_helper.so \
-  ${CHELPER_DIR}/pyhelper.c ${CHELPER_DIR}/serialqueue.c ${CHELPER_DIR}/stepcompress.c ${CHELPER_DIR}/steppersync.c \
-  ${CHELPER_DIR}/itersolve.c ${CHELPER_DIR}/trapq.c ${CHELPER_DIR}/pollreactor.c ${CHELPER_DIR}/msgblock.c ${CHELPER_DIR}/trdispatch.c \
-  ${CHELPER_DIR}/kin_cartesian.c ${CHELPER_DIR}/kin_corexy.c ${CHELPER_DIR}/kin_corexz.c ${CHELPER_DIR}/kin_delta.c \
-  ${CHELPER_DIR}/kin_deltesian.c ${CHELPER_DIR}/kin_polar.c ${CHELPER_DIR}/kin_rotary_delta.c ${CHELPER_DIR}/kin_winch.c \
-  ${CHELPER_DIR}/kin_extruder.c  ${CHELPER_DIR}/kin_shaper.c ${CHELPER_DIR}/kin_idex.c ${CHELPER_DIR}/kin_generic.c
+  -o "${CHELPER_DIR}/c_helper.so" \
+  "${SRC_PATHS[@]}"
 echo "OK"
 
 echo "Result file:"
-ls -la ${CHELPER_DIR}/c_helper.so
+ls -la "${CHELPER_DIR}/c_helper.so"
 echo ""
 
 echo "Copy file from klipper to current dir ..."
-cp -v ${CHELPER_DIR}/c_helper.so .
+cp -v "${CHELPER_DIR}/c_helper.so" .
 md5sum ./c_helper.so
 echo ""
 
 echo "ELF infos:"
-../read-elf-infos.sh 2>&1 ${CHELPER_DIR}/c_helper.so | tail -n 5
+../read-elf-infos.sh "${CHELPER_DIR}/c_helper.so" 2>&1 | tail -n 5
 echo ""
 
 echo "Finished"

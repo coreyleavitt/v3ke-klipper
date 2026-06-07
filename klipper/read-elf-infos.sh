@@ -17,6 +17,5 @@ readelf -d "$FILE" | grep NEEDED || true
 
 # 4) MIPS-spezifisch: ELF-Attribute (zeigt oft hard/soft-float-ABI)
 readelf -A "$FILE" || true
-readelf -A "$FILE" || true
 
 readelf -h "$FILE" | egrep 'Machine:|Class:|Data:|Flags:|OS/ABI:|ABI Version'

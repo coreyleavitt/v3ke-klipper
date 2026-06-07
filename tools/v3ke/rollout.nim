@@ -13,6 +13,9 @@ import common, verify, deploy, flash
 proc rolloutCmd*(args: seq[string]): int =
   echo "=== v3ke rollout: switch the Ender 3 V3 KE to mainline Klipper ==="
 
+  # Gating note: verifyCmd returns a non-zero code on ABI mismatch, while deployCmd/flashCmd raise
+  # (which already aborts rollout). The `!= 0` guards below are belt-and-suspenders so this stays
+  # correct if any of them later switches to return-code reporting.
   note("step 1/3: verify local artifacts match the device ABI")
   if verifyCmd(@[]) != 0: fail("artifacts failed ABI verification — aborting before any change")
 

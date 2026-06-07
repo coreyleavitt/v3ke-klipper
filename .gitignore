@@ -9,3 +9,29 @@ external/*/out/
 /tools/v3ke/v3ke
 /tools/v3ke/nimcache/
 nimcache/
+# Compiled Nim test binaries (built next to their .nim sources; keep the .nim, drop the ELF).
+tests/tharness
+/tools/v3ke/tests/tabi
+/tools/v3ke/tests/tharness
+/tools/v3ke/tests/tversion
+
+# Python dev/test loop (uv-managed, runs in the v3ke-dev container).
+# NB: tools/uv.lock is intentionally committed (pins dev deps for reproducibility).
+/tools/.venv/
+__pycache__/
+.pytest_cache/
+
+# Reproducibility-check staging (scripts/repro-check.sh double-build sha256 capture).
+/.repro-check/
+
+# Release zip output (build.py release --out-dir).
+/dist/
+/tools/dist/
+
+# Firmware + host build outputs — release-only artifacts (built via tools/build.py,
+# shipped in the release zip), not source. Keep .config/.dict-less sources tracked.
+/mcu-firmware/*.bin
+/mcu-firmware/*.elf
+/mcu-firmware/*.dict
+/klipper/c_helper/*.so
+/klipper/klipper_host_mcu/*.elf

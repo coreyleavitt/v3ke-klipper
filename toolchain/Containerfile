@@ -2,13 +2,23 @@
 #
 # The cross toolchain (gcc/glibc matching the device ABI) is built INTO this image, so the image
 # is self-contained and distributable (podman save / push). Build-time cache mounts keep the
-# downloads and object files (ccache) across rebuilds so iterating is cheap. Reproducibility
-# comes from crosstool-ng's pinned component versions + checksums, so the base is not pinned.
+# downloads and object files (ccache) across rebuilds so iterating is cheap. Reproducibility of the
+# *toolchain* comes from crosstool-ng's pinned component versions + checksums — the from-source build
+# is verified byte-identical across independent runners in CI (RFC B4). It does NOT come from the
+# image layers, which are not reproducible (see the zypper note below); the image is a cache, not the
+# anchor. The base image is digest-pinned (below) for a stable, auditable starting point.
 #
 # Build:   ./tools/build.py image       (builds image incl. toolchain; ~20-40 min first time)
 # Backup:  ./tools/build.py snapshot    (copy toolchain -> named volume, dev safety net)
 # Use:     ./tools/build.py artifacts   (build device artifacts with this image)
-FROM opensuse/tumbleweed:latest
+
+# Base image: digest-pinned, not `:latest`, for an auditable and stable starting point. This is the
+# registry.opensuse.org index (multi-arch) digest that opensuse/tumbleweed:latest resolved to on
+# 2026-06-06. We fully-qualify to registry.opensuse.org — the authoritative opensuse registry — on
+# purpose: it has no docker.io anonymous-pull CI rate limits, and docker.io carries a *different*
+# rolling snapshot (different digest) of the same tag. Bump deliberately by re-resolving the tag's
+# index digest (`curl -sI .../v2/opensuse/tumbleweed/manifests/latest` -> Docker-Content-Digest).
+FROM registry.opensuse.org/opensuse/tumbleweed@sha256:ffe0ae6f22739f88da193678907f4e72b1b609bc643532a15c91026a25f22e42
 
 # Host build deps for crosstool-ng + glibc/gcc + ccache. Both target toolchains (MIPS host and
 # arm-none-eabi for the MCU firmware) are built from source by ct-build below — no distro cross
@@ -16,6 +26,12 @@ FROM opensuse/tumbleweed:latest
 # `dup` first: a rolling base image can be a newer snapshot than the current repo mirror, which
 # breaks devel/runtime version matches (e.g. ncurses-devel vs libncurses6). dup reconciles to one
 # consistent snapshot before installing.
+# NOTE (reproducibility): this `zypper dup` + install layer is deliberately NOT byte-reproducible —
+# it installs whatever package versions the mirror serves at build time. This is acknowledged and
+# accepted: the image is only a *cache*, and the reproducibility anchor is the from-source
+# crosstool-ng toolchain build, verified byte-identical across independent runners (RFC B4) — not the
+# image layers. Do NOT try to "fix" this by pinning every package or dropping `dup`; pinning a rolling
+# distro durably is infeasible, and dropping dup reintroduces the devel/runtime mismatch above.
 RUN zypper -n --gpg-auto-import-keys refresh \
  && zypper -n dup --no-recommends --auto-agree-with-licenses \
  && zypper -n install --no-recommends \

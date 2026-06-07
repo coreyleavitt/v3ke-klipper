@@ -1,34 +1,32 @@
 ## `v3ke verify` — assert the MIPS host artifacts match the device ABI before flashing/deploying.
-## Checks: mipsel · nan2008 · o32 · mips32r2, and the host-MCU executable's loader.
-import std/[os, strformat, strutils]
+## Checks: mipsel · nan2008 · o32 · mips32r2 · fp_abi (FP64) · loader (ld-linux-mipsn8.so.1).
+## Uses elf.nim for parsing and ABI checking — no external readelf dependency.
+import std/[options, os, strformat, strutils]
 import common
+import elf
 
-const
-  EM_MIPS      = 8'u16
-  EF_NAN2008   = 0x0000_0400'u32   ## EF_MIPS_NAN2008
-  EF_ABI_MASK  = 0x0000_F000'u32
-  EF_ABI_O32   = 0x0000_1000'u32   ## EF_MIPS_ABI_O32
-  EF_ARCH_MASK = 0xF000_0000'u32
-  EF_ARCH_32R2 = 0x7000_0000'u32   ## EF_MIPS_ARCH_32R2
-  DeviceLoader = "ld-linux-mipsn8.so.1"
-
-proc checkMips(path: string, wantInterp: bool): bool =
+proc checkMips(path: string, kind: ArtifactKind): bool =
   echo path
   if not fileExists(path):
     warn(&"missing: {path}"); return false
-  let e = readElf(path)
-  result = true
-  if e.machine != EM_MIPS:                       warn(&"not MIPS (machine={e.machine})"); result = false
-  if (e.flags and EF_NAN2008) == 0'u32:          warn("not nan2008"); result = false
-  if (e.flags and EF_ABI_MASK) != EF_ABI_O32:    warn("not o32"); result = false
-  if (e.flags and EF_ARCH_MASK) != EF_ARCH_32R2: warn("not mips32r2"); result = false
-  let interpStr = if e.interp.len > 0: e.interp else: "(none)"
-  note(&"flags=0x{e.flags:08x}  type={e.etype}  interp={interpStr}")
-  if wantInterp and not e.interp.endsWith(DeviceLoader):   # interp is a full path, e.g. /lib/...
-    warn(&"loader is '{interpStr}', expected .../{DeviceLoader}"); result = false
-  if result:
-    ok("matches device ABI (mipsel / nan2008 / o32 / mips32r2" &
-       (if wantInterp: " / " & DeviceLoader else: "") & ")")
+  let info = readElf(path)
+  let res  = checkAbi(info, kind)
+  result = res.ok
+
+  let interpStr = if info.interp.len > 0: info.interp else: "(none)"
+  let fpStr     = if info.fpAbi.isSome: $info.fpAbi.get else: "(absent)"
+  note(&"flags=0x{info.flags:08x}  type={info.etype}  interp={interpStr}  fp_abi={fpStr}")
+
+  if not res.ok:
+    for v in res.violations:
+      case v.kind
+      of IntViolation:
+        warn(&"{v.fieldName}: expected 0x{v.intExpected:x}, got 0x{v.intActual:x}")
+      of LoaderViolation:
+        warn(&"loader: expected .../{v.loaderExpected}, got '{v.loaderActual}'")
+  else:
+    let loaderNote = if kind == Executable: " / " & ExpectedLoader else: ""
+    ok(&"matches device ABI (mipsel / nan2008 / o32 / mips32r2 / fp64{loaderNote})")
 
 proc verifyCmd*(args: seq[string]): int =
   var chelper = "klipper/c_helper/c_helper.so"
@@ -38,10 +36,10 @@ proc verifyCmd*(args: seq[string]): int =
   elif args.len != 0:
     echo "usage: v3ke verify [<c_helper.so> <klipper_mcu.elf>]"; return 1
 
-  echo "=== ABI verification (mipsel / nan2008 / o32, loader ld-linux-mipsn8.so.1) ==="
+  echo "=== ABI verification (mipsel / nan2008 / o32 / mips32r2 / fp64 / loader ld-linux-mipsn8.so.1) ==="
   var good = true
-  if not checkMips(chelper, wantInterp = false): good = false   # shared lib: no interpreter
-  if not checkMips(hostmcu, wantInterp = true):  good = false   # executable: must load mipsn8
+  if not checkMips(chelper, SharedLibrary): good = false   # shared lib: no PT_INTERP check
+  if not checkMips(hostmcu, Executable):   good = false   # executable: must load mipsn8
   if good:
     okBanner("ABI VERIFICATION PASSED")
     return 0

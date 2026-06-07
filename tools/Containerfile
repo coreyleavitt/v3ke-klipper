@@ -1,0 +1,33 @@
+# v3ke dev/test image — the lightweight container for the host-side unit-test loop
+# (`uv run pytest` + `nimble test`). Derived from the pinned Nim dev image
+# (nim 2.2.10 + gcc on openSUSE Tumbleweed, which already ships python3) with `uv` added as the
+# Python resolver. This is deliberately NOT the heavy cross-compile toolchain image
+# (`v3ke-toolchain`, ~61 GB): it builds no MIPS/ARM artifacts, it only runs the unit tests that
+# don't need the cross toolchain. Both are containers — per project convention devtools never run
+# on the host.
+FROM ghcr.io/coreyleavitt/nim:2.2.10
+
+# uv: pinned Python resolver/runner. Copied from Astral's official image (static binary, no network,
+# reproducible) rather than a curl|sh install. Bump deliberately, like any pinned tool.
+COPY --from=ghcr.io/astral-sh/uv:0.11.19 /uv /uvx /usr/local/bin/
+
+# act: local GitHub Actions runner for workflow dry-runs (parse + list, not execution —
+# act needs a container daemon to actually execute jobs, which is unavailable inside the
+# v3ke-dev container; the authoritative local gate is the pytest schema/lint test).
+# Pinned release: v0.2.89 (2024-01-xx). Bump deliberately.
+# See: https://github.com/nektos/act/releases/tag/v0.2.89
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  act_arch="x86_64" ;; \
+      aarch64) act_arch="arm64" ;; \
+      *)        echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/nektos/act/releases/download/v0.2.89/act_Linux_${act_arch}.tar.gz"; \
+    curl -fsSL "$url" -o /tmp/act.tar.gz; \
+    tar -xzf /tmp/act.tar.gz -C /usr/local/bin act; \
+    rm /tmp/act.tar.gz; \
+    act --version
+
+# Copy (don't hardlink) into the mounted workspace's .venv — hardlinks fail across the bind mount.
+ENV UV_LINK_MODE=copy

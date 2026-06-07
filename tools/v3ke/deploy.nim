@@ -23,15 +23,18 @@ proc deployCmd*(args: seq[string]): int =
   note("validating c_helper.so loads into the device's klippy-env Python...")
   let py = runRemote("ls /usr/share/klippy-env/bin/python* 2>/dev/null | head -1").strip()
   if py.len == 0: fail("device klippy-env python not found")
-  let probe = &"""{py} -c 'import ctypes; ctypes.CDLL("{StageDir}/c_helper.so"); print("LOADED")'"""
+  # py is device-controlled output — shell-quote it before reusing it as a command.
+  let probe = &"""{shQuote(py)} -c 'import ctypes; ctypes.CDLL("{StageDir}/c_helper.so"); print("LOADED")'"""
   if "LOADED" notin runRemote(probe): fail("c_helper.so failed to load on device")
   ok("c_helper.so loaded into device Python (ABI matches the live glibc)")
 
-  note("validating klipper_mcu.elf starts on the device kernel...")
-  let mcuOut = runRemote(&"cd {StageDir}; ./klipper_mcu.elf >o.txt 2>&1 & P=$!; " &
-                         "sleep 2; kill $P 2>/dev/null; cat o.txt; rm -f o.txt")
-  if "too old" in mcuOut.toLowerAscii: fail(&"klipper_mcu.elf rejected by device kernel:\n{mcuOut}")
-  ok("klipper_mcu.elf runs on the device kernel")
+  # Ask the device's OWN dynamic loader whether it can load the ELF — a precise ABI check that
+  # does NOT execute the binary (no sleep race, no orphaned process; `ldd` isn't on this BusyBox).
+  note("validating klipper_mcu.elf is loadable by the device's glibc loader...")
+  const Loader = "/lib/ld-linux-mipsn8.so.1"
+  let v = runRemote(&"{Loader} --verify {StageDir}/klipper_mcu.elf && echo VOK || echo VFAIL")
+  if "VOK" notin v: fail(&"klipper_mcu.elf not loadable by the device loader (ABI mismatch):\n{v}")
+  ok("klipper_mcu.elf passes the device loader --verify (ABI matches)")
 
   okBanner("DEPLOY (staging) OK — host artifacts validated on the real device")
   return 0

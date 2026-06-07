@@ -10,9 +10,9 @@ SCRIPT_DIR="$(pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 KLIPPER_DIR="${REPO_ROOT}/external/klipper"
 
-# In the container image CROSS_TOOLCHAIN points at the crosstool-ng install; otherwise
-# fall back to a toolchain checked out under the repo.
-TC="${CROSS_TOOLCHAIN:-${REPO_ROOT}/toolchain/mips32r5el--glibc--bleeding-edge-2018.11-1}"
+# CROSS_TOOLCHAIN points at the crosstool-ng install (set by the container / tools/build.py).
+# Required — there is no in-repo fallback toolchain (the old Bootlin tarball is gone).
+TC="${CROSS_TOOLCHAIN:?CROSS_TOOLCHAIN not set — build via tools/build.py artifacts (it runs this in the container)}"
 echo "TC: $TC"
 
 if [ ! -e "${TC}/bin/mipsel-buildroot-linux-gnu-gcc" ]; then
@@ -20,15 +20,18 @@ if [ ! -e "${TC}/bin/mipsel-buildroot-linux-gnu-gcc" ]; then
   exit 2
 fi
 
-export CROSS_BIN="${TC}/mipsel-buildroot-linux-gnu/bin"
+# klipper's Makefile builds its compiler as $(CROSS_PREFIX)gcc.
 export CROSS_PREFIX="${TC}/bin/mipsel-buildroot-linux-gnu-"
 
-pushd "$KLIPPER_DIR" >/dev/null
-make clean KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config" >/dev/null
-# Linux process MCU; olddefconfig keeps it non-interactive (config already sets MACH_LINUX)
-make olddefconfig KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config"
-make -j$(nproc) KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config" >/dev/null
-popd >/dev/null
+# Subshell (not pushd/popd): a failed make exits the subshell and propagates under set -e without
+# leaving the directory stack dirty — consistent with build-bootloader-mcu-and-host-firmware.sh.
+(
+  cd "$KLIPPER_DIR"
+  make clean KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config" >/dev/null
+  # Linux process MCU; olddefconfig keeps it non-interactive (config already sets MACH_LINUX)
+  make olddefconfig KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config"
+  make -j"$(nproc)" KCONFIG_CONFIG="${SCRIPT_DIR}/klipper-host-mcu.config" >/dev/null
+)
 
 "${SCRIPT_DIR}/../read-elf-infos.sh" "${KLIPPER_DIR}/out/klipper.elf" | tail -n 5
 
