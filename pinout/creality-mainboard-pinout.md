@@ -83,6 +83,10 @@ Load cell + HX711 chip. Creality name: **PR-touch**.
 | CLK     | PA14    |
 | GND     | GND     |
 
+> To physically connect an ST-Link to these pads and flash, see
+> [`../mcu-firmware/swd-wiring.md`](../mcu-firmware/swd-wiring.md). Deploying the
+> firmware end-to-end is covered in [`../DEPLOY.md`](../DEPLOY.md).
+
 # MCU pinout
 
 ## PINs from Creality klipper config

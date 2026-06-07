@@ -35,17 +35,22 @@ With the default value, communication fails reliably (timeout) and the printer i
 
 # Installation on MCU
 
+Wire the ST-Link to the board's SWD pads first — see
+[`swd-wiring.md`](swd-wiring.md). The commands below use `interface/stlink-dap.cfg`
+for the **ST-Link V3SET**; for an **ST-Link V2/V2-1** substitute
+`interface/stlink.cfg`. (Easiest path: `v3ke flash all` — see [`../DEPLOY.md`](../DEPLOY.md).)
+
     $ cd klipper-mcu-firmware/
     $ export KLIPPER_BOOTLOADER_FILE="katapult.bin"
 
     # Erase MCU flash memory
     $ openocd \
-        -f interface/stlink.cfg \
+        -f interface/stlink-dap.cfg \
         -f target/stm32f3x.cfg \
         -c "adapter_khz 100; init; halt; reset halt; flash erase_address 0x08000000 0x60000; flash erase_address 0x08060000 0x20000; exit"
 
     # Flash katapult bootloader
     $ openocd \
-        -f interface/stlink.cfg \
+        -f interface/stlink-dap.cfg \
         -f target/stm32f3x.cfg \
         -c "init; reset halt; flash write_image erase ${KLIPPER_BOOTLOADER_FILE} 0x08000000; verify_image ${KLIPPER_BOOTLOADER_FILE} 0x08000000; reset run; exit"
