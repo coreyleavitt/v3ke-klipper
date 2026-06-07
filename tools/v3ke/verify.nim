@@ -5,11 +5,19 @@ import std/[options, os, strformat, strutils]
 import common
 import elf
 
+proc defaultHostArtifacts*(): tuple[chelper, hostElf: string] =
+  ## Return the default artifact paths that verifyCmd uses when invoked with no
+  ## arguments.  These match the release-zip layout (host/ directory).
+  ## Exposed as a pure proc so tests can assert the contract without inspecting source text.
+  (chelper: "host/c_helper.so", hostElf: "host/klipper.elf")
+
 proc checkMips(path: string, kind: ArtifactKind): bool =
   echo path
   if not fileExists(path):
     warn(&"missing: {path}"); return false
-  let info = readElf(path)
+  let info =
+    try: readElf(path)
+    except ElfError as e: fail("malformed ELF (" & path & "): " & e.msg); return false
   let res  = checkAbi(info, kind)
   result = res.ok
 
@@ -29,8 +37,9 @@ proc checkMips(path: string, kind: ArtifactKind): bool =
     ok(&"matches device ABI (mipsel / nan2008 / o32 / mips32r2 / fp64{loaderNote})")
 
 proc verifyCmd*(args: seq[string]): int =
-  var chelper = "klipper/c_helper/c_helper.so"
-  var hostmcu = "klipper/klipper_host_mcu/klipper_mcu.elf"
+  let defaults = defaultHostArtifacts()
+  var chelper = defaults.chelper
+  var hostmcu = defaults.hostElf
   if args.len == 2:
     chelper = args[0]; hostmcu = args[1]
   elif args.len != 0:

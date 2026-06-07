@@ -1,9 +1,9 @@
 """Orchestration entry-point — assembles and runs all build steps.
 
-This module is the single Python authority that produces all four device
-artifacts (katapult.bin, klipper.bin, c_helper.so, klipper_mcu.elf) in one
-sequenced, runner-injected pass.  It is callable from unit tests (via FakeRunner)
-and from the container entrypoint (via subprocess_runner).
+This module is the single Python authority that produces all five device
+artifacts (katapult.bin, klipper.bin, klipper.dict, c_helper.so, klipper_mcu.elf)
+in one sequenced, runner-injected pass.  It is callable from unit tests (via
+FakeRunner) and from the container entrypoint (via subprocess_runner).
 
 Public interface
 ────────────────
@@ -25,28 +25,24 @@ Public interface
 
 Step ordering and the shared-tree sequencing hazard
 ───────────────────────────────────────────────────
-Both the ARM klipper build (→ klipper.bin) and the host klipper_mcu build
-(→ klipper.elf) invoke ``make`` inside ``external/klipper/``.  The host build
-opens with a ``make clean`` that would wipe the ARM klipper.bin from the
-previous step.
+Both the ARM klipper build (→ klipper.bin + klipper.dict) and the host klipper_mcu
+build (→ klipper_mcu.elf) invoke ``make`` inside ``external/klipper/``.  The host
+build opens with a ``make clean`` that would wipe everything produced by the ARM
+build from ``external/klipper/out/``.
 
-The fix mirrors the original bash script: after the ARM klipper build completes,
-a **capture step** (``cp``) copies ``klipper.bin`` from ``external/klipper/out/``
-to ``mcu-firmware/`` before the host ``make clean`` runs.  This preserves the
-artifact and is the correct sequencing:
+Three capture steps (all ``cp``) run between the ARM build and the host clean:
 
-  katapult_steps (3)        → external/katapult/out/katapult.bin
-  klipper_steps (3)         → external/klipper/out/klipper.bin
-  klipper-capture (1, cp)   → mcu-firmware/klipper.bin   [before host clean]
-  host_steps (4)            → c_helper.so + klipper.elf
-  ─────────────────────────────────────────────────────────────────────────
-  Total: 11 steps, 4 final artifacts.
+  katapult_steps (3)             → external/katapult/out/katapult.bin
+  klipper_steps (3)              → external/klipper/out/{klipper.bin,klipper.dict}
+  klipper-capture (1, cp)        → mcu-firmware/klipper.bin      [before host clean]
+  klipper-dict-capture (1, cp)   → mcu-firmware/klipper.dict     [before host clean]
+  host_steps (4)                 → c_helper.so + out/klipper.elf
+  klipper-elf-capture (1, cp)    → mcu-firmware/klipper_mcu.elf  [canonical MIPS elf]
+  ─────────────────────────────────────────────────────────────────────────────────
+  Total: 13 steps, 5 final artifacts.
 
-The klipper.dict file (Klipper's data-protocol dictionary, emitted alongside
-klipper.bin) is not explicitly captured here because mcu-firmware/ already
-tracks it and it is overwritten by each ARM klipper build; the manifest's
-artifact list handles it separately in C2.  A future slice may add an
-explicit dict-capture step.
+mcu-firmware/ is the canonical, durable location for all release artifacts.
+external/klipper/out/ is transient and must never be used at packaging time.
 
 Container entrypoint
 ────────────────────
@@ -84,26 +80,47 @@ __all__ = ["build_all_artifacts"]
 # Capture step builder
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _klipper_capture_step(repo_root: Path) -> BuildStep:
-    """Return a BuildStep that copies klipper.bin from the ARM build output to mcu-firmware/.
+def _klipper_capture_step(
+    repo_root: Path,
+    *,
+    src_name: str,
+    dst_name: str,
+    step_name: str,
+) -> BuildStep:
+    """Return a BuildStep that copies a Klipper build artifact to mcu-firmware/.
 
-    This step sits between the ARM klipper build and the host klipper_mcu
-    clean/build cycle.  The host klipper_mcu build's ``make clean`` wipes
-    ``external/klipper/out/``, which would destroy klipper.bin if it were not
-    captured first.
+    All three capture steps (klipper.bin, klipper.dict, klipper.elf→klipper_mcu.elf)
+    share this implementation.  Using the full *dst* file path — not just the parent
+    directory — as the ``cp`` destination is what guarantees the file lands at
+    ``output_path`` even when *dst_name* differs from *src_name* (the elf rename).
 
-    The capture destination (mcu-firmware/) is the canonical location used by
-    the bash script and tracked in the repository as the official build output.
+    Parameters
+    ----------
+    repo_root:
+        Absolute path to the repository root.
+    src_name:
+        Filename inside ``external/klipper/out/`` (e.g. ``"klipper.elf"``).
+    dst_name:
+        Filename to create inside ``mcu-firmware/`` (e.g. ``"klipper_mcu.elf"``).
+        May differ from *src_name* to rename on capture.
+    step_name:
+        Human-readable step label (e.g. ``"klipper-elf-capture"``).
+
+    Returns
+    -------
+    BuildStep
+        A ``cp src dst`` step whose ``output_path`` is the full destination file path.
+        Using the full file path (not the directory) is critical: ``cp src DIR/``
+        names the result after the source, silently defeating any rename.
     """
-    src = repo_root / "external" / "klipper" / "out" / "klipper.bin"
-    dst_dir = repo_root / "mcu-firmware"
-    dst = dst_dir / "klipper.bin"
+    src = repo_root / "external" / "klipper" / "out" / src_name
+    dst = repo_root / "mcu-firmware" / dst_name
 
     return BuildStep(
-        name="klipper-capture",
-        cmd=["cp", str(src), str(dst_dir)],
+        name=step_name,
+        cmd=["cp", str(src), str(dst)],
         output_path=dst,
-        kind=ArtifactKind.RAW_FIRMWARE,   # binary firmware — no ELF ABI check
+        kind=ArtifactKind.RAW_FIRMWARE,
     )
 
 
@@ -143,7 +160,7 @@ def build_all_artifacts(
     Returns
     -------
     list[StepResult]
-        StepResults for all steps executed (11 total: 6 ARM + 1 capture + 4 host).
+        StepResults for all steps executed (13 total: 6 ARM + 3 captures + 4 host).
         Fail-fast: raises RuntimeError with exc.results on the first non-zero step.
     """
     repo_root = Path(repo_root)
@@ -156,17 +173,26 @@ def build_all_artifacts(
     # Assemble the full step list in canonical order.
     #
     # Sequencing rationale (shared external/klipper/ build tree):
-    #   1. ARM katapult steps  — external/katapult/ (no conflict)
-    #   2. ARM klipper steps   — external/klipper/ → klipper.bin
-    #   3. Capture step        — cp klipper.bin → mcu-firmware/ BEFORE host clean
-    #   4. Host steps          — c_helper_steps + klipper_mcu_steps
+    #   1. ARM katapult steps     — external/katapult/ (no conflict)
+    #   2. ARM klipper steps      — external/klipper/ → klipper.bin + klipper.dict
+    #   3. klipper-capture        — cp klipper.bin → mcu-firmware/ BEFORE host clean
+    #   4. klipper-dict-capture   — cp klipper.dict → mcu-firmware/ BEFORE host clean
+    #   5. Host steps             — c_helper_steps + klipper_mcu_steps
     #      c_helper first (no make clean), then klipper_mcu (clean/olddefconfig/build)
-    #      The klipper_mcu clean wipes external/klipper/out/ — safe because step 3 already
-    #      preserved klipper.bin in mcu-firmware/.
+    #      The klipper_mcu clean wipes external/klipper/out/ — safe because steps 3+4
+    #      already preserved klipper.bin and klipper.dict in mcu-firmware/.
+    #   6. klipper-elf-capture    — cp klipper.elf → mcu-firmware/klipper_mcu.elf
+    #      Captures the MIPS host-MCU ELF after the host build completes.
     steps: list[BuildStep] = (
         arm_mcu_steps(repo_root, resolved_epoch)
-        + [_klipper_capture_step(repo_root)]
+        + [
+            _klipper_capture_step(repo_root, src_name="klipper.bin",  dst_name="klipper.bin",     step_name="klipper-capture"),
+            _klipper_capture_step(repo_root, src_name="klipper.dict", dst_name="klipper.dict",    step_name="klipper-dict-capture"),
+        ]
         + host_steps(repo_root, resolved_epoch, toolchain_root=toolchain_root)
+        + [
+            _klipper_capture_step(repo_root, src_name="klipper.elf",  dst_name="klipper_mcu.elf", step_name="klipper-elf-capture"),
+        ]
     )
 
     return run_steps(steps, runner, repo_root=repo_root)

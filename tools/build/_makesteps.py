@@ -97,7 +97,7 @@ def make_steps(
         Absolute path to the ``.config`` / ``.config``-style kconfig file.
     output_path:
         Absolute path to the expected build artifact (used for ABI checking
-        and the release manifest).  Pass ``Path("")`` for side-effect-only steps.
+        and the release manifest).  Pass ``None`` for side-effect-only steps.
     kind:
         ``ArtifactKind`` for the output artifact.
     repo_root:
@@ -122,13 +122,13 @@ def make_steps(
     clean = BuildStep(
         name=f"{name_prefix}-clean",
         cmd=["make", dir_arg, kconfig_arg, "clean"],
-        output_path=Path(""),           # clean is side-effect-only
+        output_path=None,               # clean is side-effect-only
         kind=kind,
     )
     olddefconfig = BuildStep(
         name=f"{name_prefix}-olddefconfig",
         cmd=["make", dir_arg, kconfig_arg, *det, *extra, "olddefconfig"],
-        output_path=Path(""),           # no artifact produced
+        output_path=None,               # no artifact produced
         kind=kind,
     )
     build = BuildStep(

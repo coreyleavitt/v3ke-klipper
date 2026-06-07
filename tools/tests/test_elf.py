@@ -223,3 +223,53 @@ class TestMalformedInput:
         truncated = good[: len(good) // 2]
         with pytest.raises(MalformedElfError):
             inspect_elf(truncated)
+
+    def test_truncated_phdr_table_raises(self):
+        """A program-header table that runs past end-of-file must raise, not silently break."""
+        good = _load("good_exec.elf")
+        # Truncate just enough to cut through the phdr table (keep ehdr, lose most phdrs)
+        truncated = good[:52 + 16]   # 52-byte ehdr + 16 bytes of first phdr (half of 32)
+        with pytest.raises(MalformedElfError):
+            inspect_elf(truncated)
+
+    def test_truncated_shdr_table_raises(self):
+        """A section-header table that runs past end-of-file must raise, not silently break."""
+        import struct
+        good = _load("good_exec.elf")
+        # Parse the real e_shoff so we can truncate mid-shdr-table
+        e_shoff = struct.unpack_from("<I", good, 32)[0]
+        # Keep everything up to mid-way through the first real section header
+        truncated = good[:e_shoff + 20]   # 20 < 40 (shdr entry size)
+        with pytest.raises(MalformedElfError):
+            inspect_elf(truncated)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# § H3 — absent .MIPS.abiflags section is rejected as an fp_abi violation
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestAbsentAbiflags:
+    """bad_no_abiflags.elf has every other field correct but no .MIPS.abiflags
+    section.  The absent section means fp_abi=None, which both parsers must
+    reject as an fp_abi violation (the FP-ABI regression the double-checker
+    exists to catch)."""
+
+    def test_no_abiflags_fp_abi_is_none(self):
+        info = inspect_elf(_load("bad_no_abiflags.elf"))
+        assert info.fp_abi is None
+
+    def test_no_abiflags_rejected_as_fp_abi_violation(self):
+        result = check_abi(inspect_elf(_load("bad_no_abiflags.elf")), ArtifactKind.EXECUTABLE)
+        assert result.ok is False
+        fields = {v.field for v in result.violations if isinstance(v, AbiViolation)}
+        assert "fp_abi" in fields, (
+            "absent .MIPS.abiflags must yield an fp_abi violation; "
+            f"got violations: {result.violations}"
+        )
+
+    def test_no_abiflags_fp_abi_actual_is_minus_one(self):
+        """The violation reports actual=-1 (the sentinel for absent fp_abi)."""
+        result = check_abi(inspect_elf(_load("bad_no_abiflags.elf")), ArtifactKind.EXECUTABLE)
+        v = next(v for v in result.violations
+                 if isinstance(v, AbiViolation) and v.field == "fp_abi")
+        assert v.actual == -1

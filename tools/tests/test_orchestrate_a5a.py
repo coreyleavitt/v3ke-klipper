@@ -60,7 +60,7 @@ _BANNED_SCRIPTS = {
 }
 
 # Expected step names in canonical order.
-# 6 ARM + 1 capture + 4 host = 11 total.
+# 6 ARM + 3 captures + 4 host = 13 total.
 _EXPECTED_STEP_NAMES = [
     "katapult-clean",
     "katapult-olddefconfig",
@@ -69,10 +69,12 @@ _EXPECTED_STEP_NAMES = [
     "klipper-olddefconfig",
     "klipper-build",
     "klipper-capture",          # captures klipper.bin before host clean wipes it
+    "klipper-dict-capture",     # captures klipper.dict before host clean wipes it
     "c-helper-build",
     "klipper-mcu-clean",
     "klipper-mcu-olddefconfig",
     "klipper-mcu-build",
+    "klipper-elf-capture",      # captures MIPS klipper.elf to mcu-firmware/
 ]
 
 
@@ -116,38 +118,27 @@ class TestModuleImportable:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestBuildAllArtifactsStepCount:
-    """build_all_artifacts must produce exactly 11 steps (6 ARM + 1 capture + 4 host)."""
+    """build_all_artifacts must produce exactly 13 steps (6 ARM + 3 captures + 4 host).
 
-    def test_returns_11_step_results(self):
-        results = build_all_artifacts(
-            repo_root=_REPO_ROOT,
-            toolchain_root=_FAKE_TC,
-            runner=FakeRunner(),
-            epoch=_EPOCH,
-        )
-        assert len(results) == 11, (
-            f"Expected 11 StepResults, got {len(results)}: "
-            f"{[r.name for r in results]}"
+    These tests use the capturing_run_steps pattern (patching run_steps) to examine
+    step structure without triggering H1's output-path-missing check — FakeRunner
+    doesn't create real output files, which is correct for structural tests.
+    """
+
+    def test_returns_13_step_results(self):
+        steps = _all_steps()
+        assert len(steps) == 13, (
+            f"Expected 13 steps, got {len(steps)}: {[s.name for s in steps]}"
         )
 
-    def test_all_steps_ok_with_fake_runner(self):
-        results = build_all_artifacts(
-            repo_root=_REPO_ROOT,
-            toolchain_root=_FAKE_TC,
-            runner=FakeRunner(),
-            epoch=_EPOCH,
-        )
-        for r in results:
-            assert r.ok, f"Step '{r.name}' unexpectedly failed"
+    def test_all_steps_have_names(self):
+        steps = _all_steps()
+        for s in steps:
+            assert s.name, f"Step must have a non-empty name: {s!r}"
 
     def test_step_names_in_canonical_order(self):
-        results = build_all_artifacts(
-            repo_root=_REPO_ROOT,
-            toolchain_root=_FAKE_TC,
-            runner=FakeRunner(),
-            epoch=_EPOCH,
-        )
-        actual_names = [r.name for r in results]
+        steps = _all_steps()
+        actual_names = [s.name for s in steps]
         assert actual_names == _EXPECTED_STEP_NAMES, (
             f"Step order mismatch:\n  expected: {_EXPECTED_STEP_NAMES}\n"
             f"  actual:   {actual_names}"
@@ -246,7 +237,7 @@ class TestCaptureStep:
     def test_capture_output_path_in_mcu_firmware(self):
         """output_path for the capture step is in mcu-firmware/ (the captured location)."""
         step = self._capture_step()
-        assert step.output_path != Path(""), "capture step must have an output_path"
+        assert step.output_path is not None, "capture step must have an output_path"
         assert "mcu-firmware" in step.output_path.parts, (
             f"capture output_path must be under mcu-firmware/, got: {step.output_path}"
         )
@@ -282,8 +273,52 @@ class TestNoBashScripts:
 # A5a-5: epoch resolution — None defers to resolve_source_date_epoch
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _run_with_capturing_steps(*, epoch=None, resolve_epoch=None):
+    """Call build_all_artifacts with a capturing run_steps (no real I/O) and
+    an optional epoch/resolver pair.  Returns (steps, resolver_call_count).
+
+    Used by TestEpochResolution to test epoch wiring without triggering H1's
+    output-path-missing check (FakeRunner doesn't create real files).
+    """
+    call_count = [0]
+    captured_steps: list = []
+
+    def capturing_run_steps(steps, runner, *, repo_root=None):
+        captured_steps.extend(steps)
+        return [StepResult(name=s.name, ok=True, duration=0.0, abi=None, detail="ok") for s in steps]
+
+    resolver_calls = [0]
+
+    def counting_resolver(repo_root):
+        resolver_calls[0] += 1
+        return _EPOCH
+
+    kwargs = dict(
+        repo_root=_REPO_ROOT,
+        toolchain_root=_FAKE_TC,
+        runner=FakeRunner(),
+    )
+    if epoch is not None:
+        kwargs["epoch"] = epoch
+    else:
+        kwargs["epoch"] = None
+    if resolve_epoch is not None:
+        kwargs["_resolve_epoch"] = resolve_epoch
+    else:
+        kwargs["_resolve_epoch"] = counting_resolver
+
+    with patch("build.orchestrate.run_steps", capturing_run_steps):
+        build_all_artifacts(**kwargs)
+
+    return captured_steps, resolver_calls[0]
+
+
 class TestEpochResolution:
-    """epoch=None must call resolve_source_date_epoch; epoch supplied must skip it."""
+    """epoch=None must call resolve_source_date_epoch; epoch supplied must skip it.
+
+    Tests use capturing_run_steps so that H1's output-path-missing check is
+    never triggered (FakeRunner produces no real files; structural tests only).
+    """
 
     def test_none_epoch_calls_resolver(self):
         """When epoch=None, the resolver is called exactly once."""
@@ -293,13 +328,7 @@ class TestEpochResolution:
             call_count[0] += 1
             return _EPOCH
 
-        build_all_artifacts(
-            repo_root=_REPO_ROOT,
-            toolchain_root=_FAKE_TC,
-            runner=FakeRunner(),
-            epoch=None,
-            _resolve_epoch=fake_resolver,
-        )
+        _, _ = _run_with_capturing_steps(epoch=None, resolve_epoch=fake_resolver)
         assert call_count[0] == 1, (
             f"Resolver called {call_count[0]} times; expected exactly 1"
         )
@@ -312,13 +341,7 @@ class TestEpochResolution:
             call_count[0] += 1
             return 0
 
-        build_all_artifacts(
-            repo_root=_REPO_ROOT,
-            toolchain_root=_FAKE_TC,
-            runner=FakeRunner(),
-            epoch=_EPOCH,
-            _resolve_epoch=should_not_be_called,
-        )
+        _, _ = _run_with_capturing_steps(epoch=_EPOCH, resolve_epoch=should_not_be_called)
         assert call_count[0] == 0, (
             f"Resolver called {call_count[0]} times; should have been skipped (epoch supplied)"
         )
@@ -331,13 +354,7 @@ class TestEpochResolution:
             received_roots.append(repo_root)
             return _EPOCH
 
-        build_all_artifacts(
-            repo_root=_REPO_ROOT,
-            toolchain_root=_FAKE_TC,
-            runner=FakeRunner(),
-            epoch=None,
-            _resolve_epoch=recording_resolver,
-        )
+        _, _ = _run_with_capturing_steps(epoch=None, resolve_epoch=recording_resolver)
         assert received_roots == [_REPO_ROOT], (
             f"Resolver received wrong repo_root: {received_roots}"
         )

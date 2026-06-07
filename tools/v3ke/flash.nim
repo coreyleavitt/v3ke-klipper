@@ -1,7 +1,7 @@
 ## `v3ke flash` — flash the motion MCU (GD32F303 / STM32F103) over SWD via openocd + ST-Link.
 ## Adds what flash-mcu.sh couldn't safely do: backup-before-erase with RDP/blank detection,
 ## and read-back-and-compare after every write. Any failure raises and stops (no half-flashed MCU).
-import std/[os, osproc, streams, strformat, strutils, sequtils]
+import std/[os, osproc, streams, strformat, strutils, sequtils, tempfiles]
 import common
 
 const
@@ -63,11 +63,14 @@ proc flashOne(name, path: string; address: int) =
   discard ocd(&"init; reset halt; flash write_image erase {{{path}}} 0x{address:x}; " &
               &"verify_image {{{path}}} 0x{address:x}; reset run; exit")
   # Belt-and-suspenders beyond verify_image: read the region back and byte-compare.
-  let tmp = getTempDir() / &"v3ke-{name}.readback"
-  checkOcdPath(tmp)
-  discard ocd(&"init; halt; dump_image {{{tmp}}} 0x{address:x} 0x{want.len:x}; exit")
-  let got = readFile(tmp)
-  removeFile(tmp)
+  # Use createTempFile so the path is unique and O_EXCL-created; prevents a TOCTOU
+  # where an attacker pre-creates a predictable path to skip or spoof the verify step.
+  let (tmpFile, tmpPath) = createTempFile("v3ke_rb_", ".bin")
+  tmpFile.close()   # close so openocd can write to the path
+  checkOcdPath(tmpPath)
+  discard ocd(&"init; halt; dump_image {{{tmpPath}}} 0x{address:x} 0x{want.len:x}; exit")
+  let got = readFile(tmpPath)
+  removeFile(tmpPath)
   if got != want: fail(&"{name} read-back MISMATCH ({got.len} vs {want.len} B)")
   ok(&"{name} flashed + read-back verified ({want.len} B)")
 

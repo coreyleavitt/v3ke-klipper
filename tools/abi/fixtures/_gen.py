@@ -442,6 +442,20 @@ FIXTURES: list[tuple[str, dict]] = [
             interp  = "/lib/ld-linux.so.3",   # plausible but wrong
         ),
     ),
+    # ── bad-no_abiflags (absent .MIPS.abiflags section) ──────────────────────
+    # The .MIPS.abiflags section carries the fp_abi (fp64/nan2008) info; its
+    # absence is exactly the FP-ABI regression the double-checker exists to
+    # catch.  Both parsers must report an fp_abi violation when this section is
+    # missing, not silently accept the file.
+    (
+        "bad_no_abiflags.elf",
+        dict(
+            e_flags          = DEVICE_EFLAGS,
+            fp_abi           = FP_ABI_FP64,   # value unused — section omitted
+            interp           = LOADER,
+            include_abiflags = False,
+        ),
+    ),
 ]
 
 

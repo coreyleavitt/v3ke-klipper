@@ -12,6 +12,7 @@ nimcache/
 # Compiled Nim test binaries (built next to their .nim sources; keep the .nim, drop the ELF).
 tests/tharness
 /tools/v3ke/tests/tabi
+/tools/v3ke/tests/tfindings
 /tools/v3ke/tests/tharness
 /tools/v3ke/tests/tversion
 

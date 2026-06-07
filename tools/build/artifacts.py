@@ -60,13 +60,13 @@ class BuildStep:
     ------
     name        : Human-readable label (e.g. "katapult-clean").
     cmd         : The command + arguments to pass to the runner.
-    output_path : Expected output artifact; Path("") for side-effect-only steps
+    output_path : Expected output artifact; None for side-effect-only steps
                   that produce no single output file (e.g. clean).
     kind        : ArtifactKind for the output.  RAW_FIRMWARE skips check_abi.
     """
     name:        str
     cmd:         list[str]
-    output_path: Path
+    output_path: Optional[Path]
     kind:        ArtifactKind
 
 
@@ -86,7 +86,7 @@ class StepResult:
     abi is None when:
     - the step failed (ok=False), OR
     - kind is RAW_FIRMWARE (ABI check not applicable), OR
-    - output_path is empty / the file did not exist after the step.
+    - output_path is None (no declared artifact).
     """
     name:     str
     ok:       bool
@@ -161,34 +161,37 @@ def run_steps(
     for step in steps:
         result_val = runner(step.cmd)
         ok = result_val.returncode == 0
+        detail = f"exit {result_val.returncode}" if not ok else f"ok ({result_val.elapsed:.3f}s)"
 
         abi: Optional[AbiResult] = None
-        if ok and step.kind is not ArtifactKind.RAW_FIRMWARE and step.output_path != Path(""):
-            if step.output_path.exists():
+        if ok and step.output_path is not None:
+            # Check that the declared output file actually exists after the step.
+            if not step.output_path.exists():
+                ok = False
+                detail = f"output_path missing after step: {step.output_path}"
+            elif step.kind is not ArtifactKind.RAW_FIRMWARE:
+                # ELF-bearing steps: parse the artifact and check ABI.
                 from build.elf import check_abi, inspect_elf, MalformedElfError
                 data = step.output_path.read_bytes()
                 try:
                     info = inspect_elf(data)
                     abi = check_abi(info, step.kind)
-                except MalformedElfError:
-                    abi = None
+                except MalformedElfError as exc_elf:
+                    ok = False
+                    detail = f"malformed ELF in output_path {step.output_path}: {exc_elf}"
 
         sr = StepResult(
             name=step.name,
             ok=ok,
             duration=result_val.elapsed,
             abi=abi,
-            detail=(
-                f"exit {result_val.returncode}"
-                if not ok
-                else f"ok ({result_val.elapsed:.3f}s)"
-            ),
+            detail=detail,
         )
         results.append(sr)
 
         if not ok:
             exc = RuntimeError(
-                f"Step '{step.name}' failed with returncode {result_val.returncode}"
+                f"Step '{step.name}' failed: {detail}"
             )
             exc.results = results  # type: ignore[attr-defined]
             raise exc

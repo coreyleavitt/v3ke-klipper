@@ -21,3 +21,4 @@ task test, "Run Nim unit tests (C backend)":
   exec "nim c --hints:off --path:. -r tests/tharness.nim"
   exec "nim c --hints:off --path:. -r tests/tabi.nim"
   exec "nim c --hints:off --path:. -r tests/tversion.nim"
+  exec "nim c --hints:off --path:. -r tests/tfindings.nim"

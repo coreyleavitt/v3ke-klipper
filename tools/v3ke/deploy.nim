@@ -6,9 +6,16 @@ import common, sshdev
 
 const StageDir* = "/usr/data/v3ke-staging"   # persistent partition; survives reboots
 
+proc defaultDeployArtifacts*(): tuple[chelper, hostElf: string] =
+  ## Return the default artifact paths that deployCmd uses when invoked with no
+  ## arguments.  These match the release-zip layout (host/ directory).
+  ## Exposed as a pure proc so tests can assert the contract without inspecting source text.
+  (chelper: "host/c_helper.so", hostElf: "host/klipper.elf")
+
 proc deployCmd*(args: seq[string]): int =
-  var chelper = "klipper/c_helper/c_helper.so"
-  var hostmcu = "klipper/klipper_host_mcu/klipper_mcu.elf"
+  let defaults = defaultDeployArtifacts()
+  var chelper = defaults.chelper
+  var hostmcu = defaults.hostElf
   if args.len == 2:
     chelper = args[0]; hostmcu = args[1]
   elif args.len != 0:

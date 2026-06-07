@@ -157,10 +157,17 @@ proc readElf*(path: string): ElfInfo =
   let eShnum  = u16(b, 48).int
 
   # ── Program headers → PT_INTERP ─────────────────────────────────────────────
+  # The parser reads up to p+16 (p_filesz, a uint32) so each entry must be at
+  # least 20 bytes.  Enforce before the loop so a crafted tiny ePhentsize never
+  # reaches the out-of-bounds u32 read (which would raise IndexDefect, not ElfError).
+  if ePhnum > 0:
+    elfCheck ePhentsize >= 20,
+      &"{path}: e_phentsize={ePhentsize} is too small (need >= 20 to read p_offset and p_filesz)"
   var interp = ""
   for i in 0 ..< ePhnum:
     let p = ePhoff + i * ePhentsize
-    if p + 20 > b.len: break
+    elfCheck p + ePhentsize <= b.len,
+      &"{path}: program-header table truncated (entry {i} at offset {p}, need {ePhentsize} bytes, have {b.len - p})"
     if u32(b, p) == 3'u32:   # PT_INTERP
       let off = u32(b, p + 4).int
       let sz  = u32(b, p + 16).int
@@ -170,12 +177,18 @@ proc readElf*(path: string): ElfInfo =
       break
 
   # ── Section headers → .MIPS.abiflags (sh_type = 0x7000002A) ────────────────
+  # The parser reads up to s+20 (sh_size, a uint32) so each entry must be at
+  # least 24 bytes.  Enforce before the loop — same rationale as ePhentsize above.
+  if eShnum > 0:
+    elfCheck eShentsize >= 24,
+      &"{path}: e_shentsize={eShentsize} is too small (need >= 24 to read sh_type, sh_offset, sh_size)"
   var fpAbi: Option[uint8] = none(uint8)
   const ShMipsAbiflags = 0x7000002A'u32
   const AbiflagsMinSize = 24
   for i in 0 ..< eShnum:
     let s = eShoff + i * eShentsize
-    if s + 40 > b.len: break
+    elfCheck s + eShentsize <= b.len,
+      &"{path}: section-header table truncated (entry {i} at offset {s}, need {eShentsize} bytes, have {b.len - s})"
     let shType   = u32(b, s + 4)
     let shOffset = u32(b, s + 16).int
     let shSize   = u32(b, s + 20).int

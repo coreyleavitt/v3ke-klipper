@@ -178,7 +178,11 @@ _SUBMODULE_PATHS = {
 }
 
 
-def submodule_provenance(repo_root: Path) -> dict[str, dict]:
+def submodule_provenance(
+    repo_root: Path,
+    *,
+    runner: Callable[[list[str]], str] = _subprocess_runner_text,
+) -> dict[str, dict]:
     """Return {name: {"url": ..., "commit": ...}} for the three pinned submodules.
 
     Reads the real repo via git commands.  Deterministic from the pinned submodule
@@ -188,6 +192,11 @@ def submodule_provenance(repo_root: Path) -> dict[str, dict]:
     ----------
     repo_root:
         Absolute path to the repository root.
+    runner:
+        Callable that accepts a command list and returns stdout as a string.
+        Defaults to ``_subprocess_runner_text`` (a real subprocess call).
+        Injectable for unit tests — pass a fake runner to avoid real git calls.
+        Matches the established concrete-default pattern used by ``resolve_version``.
 
     Returns
     -------
@@ -203,19 +212,15 @@ def submodule_provenance(repo_root: Path) -> dict[str, dict]:
         path = _SUBMODULE_PATHS[name]
 
         # URL from .gitmodules
-        url_proc = subprocess.run(
+        url = runner(
             ["git", "config", "--file", str(repo_root / ".gitmodules"),
-             f"submodule.{path}.url"],
-            capture_output=True, text=True, check=True,
-        )
-        url = url_proc.stdout.strip()
+             f"submodule.{path}.url"]
+        ).strip()
 
         # Pinned commit: the SHA that HEAD records for this submodule path
-        commit_proc = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", f"HEAD:{path}"],
-            capture_output=True, text=True, check=True,
-        )
-        commit = commit_proc.stdout.strip()
+        commit = runner(
+            ["git", "-C", str(repo_root), "rev-parse", f"HEAD:{path}"]
+        ).strip()
 
         result[name] = {"url": url, "commit": commit}
 
@@ -320,16 +325,19 @@ def release_members(
 ) -> list[tuple[Path, str]]:
     """Return the ordered plan of (source_path, archive_name) for the release zip.
 
-    The manifest.json entry uses a sentinel path (<out_dir>/manifest.json) that
-    write_release_zip fills in after computing it.  release_members itself records
-    the expected archive name so callers can verify the plan without I/O.
+    All artifact source paths point to ``mcu-firmware/`` (the canonical captured
+    locations) rather than ``external/klipper/out/``, which is wiped by the host
+    ``make clean`` and must never be used at packaging time.
+
+    manifest.json is NOT included here — it is appended directly by
+    write_release_zip after it is computed, so it never needs a sentinel path.
 
     Archive layout:
       firmware/katapult.bin
-      firmware/klipper.bin
+      firmware/klipper.bin           ← mcu-firmware/klipper.bin
       host/c_helper.so
-      host/klipper.elf
-      host/klipper.dict
+      host/klipper.elf               ← mcu-firmware/klipper_mcu.elf
+      host/klipper.dict              ← mcu-firmware/klipper.dict
       v3ke
       INSTALL.md
       SOURCES.md
@@ -337,7 +345,7 @@ def release_members(
       LICENSES/klipper.LICENSE       (from external/klipper/COPYING)
       LICENSES/katapult.LICENSE
       LICENSES/mainsail-config.LICENSE
-      manifest.json                  (sentinel — written by write_release_zip)
+      manifest.json                  (appended by write_release_zip)
 
     Parameters
     ----------
@@ -349,20 +357,23 @@ def release_members(
     Returns
     -------
     list of (Path, str)
-        Ordered (source_path, archive_name) pairs.  The manifest.json source
-        path is a sentinel under <repo_root>/.release-tmp/manifest.json that
-        write_release_zip replaces with the real computed path.
+        Ordered (source_path, archive_name) pairs.  Does NOT include
+        manifest.json — that is appended by write_release_zip.
     """
     r = Path(repo_root)
 
     members: list[tuple[Path, str]] = [
         # Firmware blobs
+        # katapult.bin: lives in external/katapult/out/ (not wiped by host build)
         (r / "external" / "katapult" / "out" / "katapult.bin",        "firmware/katapult.bin"),
-        (r / "external" / "klipper"  / "out" / "klipper.bin",         "firmware/klipper.bin"),
+        # klipper.bin: canonical captured copy in mcu-firmware/ (out/ is wiped by host clean)
+        (r / "mcu-firmware" / "klipper.bin",                          "firmware/klipper.bin"),
         # Host artifacts
         (r / "external" / "klipper" / "klippy" / "chelper" / "c_helper.so", "host/c_helper.so"),
-        (r / "external" / "klipper" / "out" / "klipper.elf",          "host/klipper.elf"),
-        (r / "external" / "klipper" / "out" / "klipper.dict",         "host/klipper.dict"),
+        # klipper_mcu.elf: MIPS host-MCU ELF captured to mcu-firmware/ after host build
+        (r / "mcu-firmware" / "klipper_mcu.elf",                      "host/klipper.elf"),
+        # klipper.dict: captured to mcu-firmware/ before host clean wipes out/
+        (r / "mcu-firmware" / "klipper.dict",                         "host/klipper.dict"),
         # v3ke CLI binary
         (r / "tools" / "v3ke" / "v3ke",                                "v3ke"),
         # Human-readable files (from bundled release_assets)
@@ -373,8 +384,6 @@ def release_members(
         (r / "external" / "klipper" / "COPYING",                      "LICENSES/klipper.LICENSE"),
         (r / "external" / "katapult" / "LICENSE",                      "LICENSES/katapult.LICENSE"),
         (r / "external" / "mainsail-config" / "LICENSE",               "LICENSES/mainsail-config.LICENSE"),
-        # Manifest — sentinel path; write_release_zip substitutes the real temp file
-        (r / ".release-tmp" / "manifest.json",                         "manifest.json"),
     ]
     return members
 
@@ -474,18 +483,29 @@ def write_release_zip(
     _prov_fn = _submodule_provenance or submodule_provenance
     submodules = _prov_fn(repo_root)
 
-    # Get the member plan (without manifest.json having real content yet)
+    # Get the member plan (manifest.json is NOT in the list — appended below)
     members = release_members(repo_root, version=version)
 
-    # Hash all artifact members (everything except the manifest sentinel)
+    # Read each artifact's bytes ONCE — the same bytes are used for both the
+    # manifest sha256 and the zip payload.  Two reads would risk the manifest
+    # attesting different bytes than what was packed (R2-L1).
     artifact_arcnames = {
         "firmware/katapult.bin", "firmware/klipper.bin",
         "host/c_helper.so", "host/klipper.elf", "host/klipper.dict",
     }
+    member_bytes: list[tuple[str, bytes]] = []  # (arcname, raw_bytes) in members order
     artifact_dicts: list[dict] = []
     for src, arcname in members:
+        data = src.read_bytes()
+        member_bytes.append((arcname, data))
         if arcname in artifact_arcnames:
-            artifact_dicts.append(hash_artifact(src, arcname))
+            sha = hashlib.sha256(data).hexdigest()
+            artifact_dicts.append({
+                "name": src.name,
+                "path": arcname,
+                "sha256": sha,
+                "size": len(data),
+            })
 
     # Build and validate the manifest
     manifest = build_manifest(
@@ -498,13 +518,10 @@ def write_release_zip(
         reproducible=reproducible,
     )
     validate_manifest(manifest)
-
-    # Write manifest to a temp location so it can go into the zip
     manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
-    tmp_manifest = out_dir / "_manifest_tmp.json"
-    tmp_manifest.write_text(manifest_json)
 
-    # Build the final zip with deterministic member order + fixed mtime
+    # Build the final zip with deterministic member order + fixed mtime.
+    # Write from the already-read bytes (no second read).
     zip_name = release_zip_name(version)
     zip_path = out_dir / zip_name
 
@@ -516,17 +533,12 @@ def write_release_zip(
     )
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for src, arcname in members:
-            if arcname == "manifest.json":
-                # Write the real manifest content
-                info = zipfile.ZipInfo(arcname, date_time=fixed_mtime)
-                zf.writestr(info, manifest_json)
-            else:
-                info = zipfile.ZipInfo(arcname, date_time=fixed_mtime)
-                info.compress_type = zipfile.ZIP_DEFLATED
-                zf.writestr(info, src.read_bytes())
-
-    # Cleanup temp file
-    tmp_manifest.unlink(missing_ok=True)
+        for arcname, data in member_bytes:
+            info = zipfile.ZipInfo(arcname, date_time=fixed_mtime)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, data)
+        # Append manifest.json directly — not via release_members() sentinel
+        manifest_info = zipfile.ZipInfo("manifest.json", date_time=fixed_mtime)
+        zf.writestr(manifest_info, manifest_json)
 
     return zip_path

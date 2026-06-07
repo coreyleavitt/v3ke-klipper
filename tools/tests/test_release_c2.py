@@ -390,20 +390,28 @@ class TestHashArtifact:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _make_fake_repo(tmp_path: Path) -> Path:
-    """Build a minimal fake repo tree that mirrors the real layout."""
+    """Build a minimal fake repo tree that mirrors the real layout.
+
+    All release artifact source paths now point to mcu-firmware/ (the canonical
+    captured locations), not external/klipper/out/ (which is wiped by the host
+    make clean at build time).
+    """
     repo = tmp_path / "repo"
 
-    # Device artifacts
+    # Directories for artifacts that live outside mcu-firmware/
     (repo / "external" / "katapult" / "out").mkdir(parents=True)
-    (repo / "external" / "klipper" / "out").mkdir(parents=True)
+    (repo / "external" / "klipper" / "out").mkdir(parents=True)   # normally wiped; empty here
     (repo / "external" / "klipper" / "klippy" / "chelper").mkdir(parents=True)
     (repo / "external" / "mainsail-config").mkdir(parents=True)
 
-    # Write small dummy content for every artifact
+    # Canonical captured locations in mcu-firmware/
+    (repo / "mcu-firmware").mkdir(parents=True)
+    (repo / "mcu-firmware" / "klipper.bin").write_bytes(b"klipper")
+    (repo / "mcu-firmware" / "klipper.dict").write_bytes(b"dict")
+    (repo / "mcu-firmware" / "klipper_mcu.elf").write_bytes(b"elf")
+
+    # Artifacts that are NOT in mcu-firmware/
     (repo / "external" / "katapult" / "out" / "katapult.bin").write_bytes(b"katapult")
-    (repo / "external" / "klipper" / "out" / "klipper.bin").write_bytes(b"klipper")
-    (repo / "external" / "klipper" / "out" / "klipper.elf").write_bytes(b"elf")
-    (repo / "external" / "klipper" / "out" / "klipper.dict").write_bytes(b"dict")
     (repo / "external" / "klipper" / "klippy" / "chelper" / "c_helper.so").write_bytes(b"so")
 
     # v3ke binary
@@ -417,7 +425,6 @@ def _make_fake_repo(tmp_path: Path) -> Path:
     (repo / "external" / "mainsail-config" / "LICENSE").write_text("mainsail license")
 
     # Static release assets (would normally be in tools/build/release_assets)
-    # For the test, symlink to the real ones or create stubs
     assets_src = Path(__file__).resolve().parent.parent / "build" / "release_assets"
     if assets_src.exists():
         import shutil
@@ -426,9 +433,6 @@ def _make_fake_repo(tmp_path: Path) -> Path:
         (repo / "release_assets").mkdir()
         (repo / "release_assets" / "INSTALL.md").write_text("install")
         (repo / "release_assets" / "SOURCES.md").write_text("sources")
-
-    # manifest.json placeholder (written by write_release_zip; listed in members)
-    # release_members may include it as a sentinel path even if it doesn't exist yet.
 
     return repo
 
@@ -499,11 +503,14 @@ class TestReleaseMembers:
         license_arcnames = [a for a in arcnames if a.startswith("LICENSES/")]
         assert len(license_arcnames) >= 2
 
-    def test_manifest_json_in_plan(self, tmp_path):
+    def test_manifest_json_not_in_plan(self, tmp_path):
+        """manifest.json must NOT be in release_members() — it is appended by write_release_zip."""
         repo = _make_fake_repo(tmp_path)
         members = release_members(repo, version="v0.1.0")
         arcnames = [arcname for _, arcname in members]
-        assert "manifest.json" in arcnames
+        assert "manifest.json" not in arcnames, (
+            "manifest.json must not appear in release_members() — appended directly by write_release_zip"
+        )
 
     def test_source_paths_are_path_objects(self, tmp_path):
         repo = _make_fake_repo(tmp_path)
@@ -685,10 +692,18 @@ class TestWriteReleaseZip:
         with zipfile.ZipFile(zip_path) as zf:
             manifest = json.loads(zf.read("manifest.json"))
         names = {a["name"] for a in manifest["artifacts"]}
+        paths = {a["path"] for a in manifest["artifacts"]}
         assert "katapult.bin" in names
         assert "klipper.bin" in names
         assert "c_helper.so" in names
-        assert "klipper.elf" in names
+        # The MIPS host elf is sourced from klipper_mcu.elf (canonical name)
+        # but packaged as host/klipper.elf in the archive.
+        assert "klipper_mcu.elf" in names, (
+            f"Manifest must reference klipper_mcu.elf as the host ELF artifact name; got: {names}"
+        )
+        assert "host/klipper.elf" in paths, (
+            f"Manifest must have host/klipper.elf as archive path; got: {paths}"
+        )
         assert "klipper.dict" in names
 
     def test_manifest_provenance_toolchain(self, tmp_path):

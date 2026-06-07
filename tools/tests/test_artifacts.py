@@ -132,7 +132,7 @@ class TestKconfigPathsExist:
         """katapult build step output_path should be under external/katapult/out/."""
         steps = katapult_steps(_REPO_ROOT, _EPOCH)
         build_step = steps[-1]  # build is the last of the three
-        assert build_step.output_path != Path(""), "build step must have an output_path"
+        assert build_step.output_path is not None, "build step must have an output_path"
         assert "katapult" in build_step.output_path.name
         assert build_step.output_path.suffix == ".bin"
         assert "out" in build_step.output_path.parts
@@ -141,7 +141,7 @@ class TestKconfigPathsExist:
         """klipper build step output_path should be under external/klipper/out/."""
         steps = klipper_steps(_REPO_ROOT, _EPOCH)
         build_step = steps[-1]
-        assert build_step.output_path != Path(""), "build step must have an output_path"
+        assert build_step.output_path is not None, "build step must have an output_path"
         assert "klipper" in build_step.output_path.name
         assert build_step.output_path.suffix == ".bin"
         assert "out" in build_step.output_path.parts
@@ -242,14 +242,25 @@ class TestRawFirmwareSkipsAbiCheck:
                 f"Step '{step.name}' has kind={step.kind!r}, expected RAW_FIRMWARE"
             )
 
-    def test_step_results_have_none_abi_for_raw_firmware(self):
+    def test_step_results_have_none_abi_for_raw_firmware(self, tmp_path):
         """With FakeRunner, run_steps must leave abi=None for every RAW_FIRMWARE step.
 
-        Since FakeRunner returns success and no output files exist (fake build),
-        no ABI check can occur.  But even if an output file *did* exist, the
-        RAW_FIRMWARE guard in run_steps must prevent check_abi from being called.
+        Uses dummy steps with output_path pointing to existing files so H1's
+        missing-output-path check does not fire.  The RAW_FIRMWARE guard must
+        prevent check_abi from being called regardless of the file contents.
         """
-        steps = arm_mcu_steps(_REPO_ROOT, _EPOCH)
+        # Create dummy output files for each step so the missing-file check passes.
+        dummy_bin = tmp_path / "dummy.bin"
+        dummy_bin.write_bytes(b"not-a-real-firmware")
+        steps = [
+            BuildStep(
+                name=f"fw-step-{i}",
+                cmd=["true"],
+                output_path=dummy_bin,
+                kind=ArtifactKind.RAW_FIRMWARE,
+            )
+            for i in range(3)
+        ]
         results = run_steps(steps, FakeRunner())
         assert len(results) == len(steps)
         for sr in results:
@@ -258,15 +269,13 @@ class TestRawFirmwareSkipsAbiCheck:
                 "expected None for RAW_FIRMWARE steps"
             )
 
-    def test_spy_check_abi_never_called_for_raw_firmware(self):
+    def test_spy_check_abi_never_called_for_raw_firmware(self, tmp_path):
         """Inject a spy check_abi; confirm it is never called for RAW_FIRMWARE steps.
 
-        We monkeypatch build.artifacts.check_abi with a spy that records calls.
+        We monkeypatch build.elf.check_abi with a spy that records calls.
         Even if FakeRunner returns success and the step has an output_path that
-        happens to exist, the kind=RAW_FIRMWARE guard must short-circuit.
+        exists, the kind=RAW_FIRMWARE guard must short-circuit before check_abi.
         """
-        import build.artifacts as artifacts_mod
-
         calls: list[tuple] = []
 
         def spy_check_abi(info, kind):
@@ -274,15 +283,22 @@ class TestRawFirmwareSkipsAbiCheck:
             from build.elf import AbiResult
             return AbiResult.not_applicable()
 
-        # Patch at module level temporarily
-        original = None
-        # run_steps imports check_abi inside the function from build.elf,
-        # so we patch it there.
+        # Create a dummy file so the missing-output-path check doesn't fire.
+        dummy_bin = tmp_path / "dummy.bin"
+        dummy_bin.write_bytes(b"firmware")
+        steps = [
+            BuildStep(
+                name="fw-step",
+                cmd=["true"],
+                output_path=dummy_bin,
+                kind=ArtifactKind.RAW_FIRMWARE,
+            )
+        ]
+
         import build.elf as elf_mod
         original_check_abi = elf_mod.check_abi
         elf_mod.check_abi = spy_check_abi  # type: ignore[assignment]
         try:
-            steps = arm_mcu_steps(_REPO_ROOT, _EPOCH)
             run_steps(steps, FakeRunner())
         finally:
             elf_mod.check_abi = original_check_abi  # type: ignore[assignment]
@@ -305,12 +321,17 @@ class TestFailFast:
     """
 
     def _make_dummy_steps(self, n: int) -> list[BuildStep]:
-        """Produce n trivial RAW_FIRMWARE BuildSteps for testing."""
+        """Produce n trivial side-effect-only RAW_FIRMWARE BuildSteps for testing.
+
+        Uses output_path=None (not Path('')) so that H1's existence check is
+        genuinely bypassed — Path('') resolves to cwd which exists, so it would
+        accidentally satisfy the check rather than exercising the None-bypass.
+        """
         return [
             BuildStep(
                 name=f"step-{i}",
                 cmd=["true"],
-                output_path=Path(""),
+                output_path=None,
                 kind=ArtifactKind.RAW_FIRMWARE,
             )
             for i in range(n)
@@ -377,12 +398,10 @@ class TestFailFast:
         assert len(results) == 6
         assert all(sr.ok for sr in results)
 
-    def test_real_arm_steps_all_pass_with_fake_runner(self):
-        """arm_mcu_steps + FakeRunner → 6 successful StepResults, no exception."""
+    def test_arm_steps_step_count(self):
+        """arm_mcu_steps produces exactly 6 steps (structural, no runner required)."""
         steps = arm_mcu_steps(_REPO_ROOT, _EPOCH)
-        results = run_steps(steps, FakeRunner())
-        assert len(results) == 6
-        assert all(sr.ok for sr in results)
+        assert len(steps) == 6
 
 
 # ──────────────────────────────────────────────────────────────────────────────
