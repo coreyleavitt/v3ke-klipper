@@ -336,16 +336,66 @@ jobs:
           cat toolchain-versions.json
 
       # -----------------------------------------------------------------------
-      # 7. Package release zip
+      # 7. Build device artifacts
+      #
+      # Explicitly produces all device artifacts (ARM MCU firmware, MIPS host
+      # pieces) using the pulled-by-digest toolchain image.  Decouples packaging
+      # from the repro gate's side effects — packaging must not depend on
+      # artifacts left behind by repro-check.sh.
+      # -----------------------------------------------------------------------
+      - name: Build device artifacts
+        run: |
+          IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
+          python3 tools/build.py --runtime docker --image "${IMAGE_REF}" artifacts
+
+      # -----------------------------------------------------------------------
+      # 8. Build v3ke CLI
+      #
+      # Compiles tools/v3ke/v3ke (linux-amd64) using the pinned, now-public Nim
+      # image — zero build of Nim itself, no GHCR login required (public image).
+      # tools/v3ke/v3ke is gitignored (compiled output), so it must be built here
+      # before packaging; the binary is included in the release zip.
+      #
+      # The `version = pkgVersion()` line in v3ke.nimble emits a non-fatal
+      # "must be string literals" warning at nimble-parse time — this is a known
+      # nimble limitation and does not prevent the build from succeeding.
+      # -----------------------------------------------------------------------
+      - name: Build v3ke CLI
+        run: |
+          docker run --rm \
+            -v "$PWD":/w \
+            -w /w/tools/v3ke \
+            ghcr.io/coreyleavitt/nim:2.2.10 \
+            nimble build -d:release -y
+
+      # -----------------------------------------------------------------------
+      # 9. Set up uv
+      #
+      # Installs uv so the package step can run under `uv run --project tools`,
+      # which provisions jsonschema and other locked dev deps from tools/uv.lock.
+      # jsonschema is required by build.py release for manifest validation.
+      # -----------------------------------------------------------------------
+      - name: Set up uv
+        # astral-sh/setup-uv v8.2.0 — SHA-pinned.
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.11.19"
+
+      # -----------------------------------------------------------------------
+      # 10. Package release zip
       #
       # Produces dist/v3ke-<version>-linux-amd64.zip + dist/manifest.json.
       # --reproducible is justified: the repro gate (step 5) proved byte-identical
       # output across two independent cold builds.
+      #
+      # Run under `uv run --project tools` so jsonschema (pinned in tools/uv.lock)
+      # is available for manifest validation.  Executed from the repo root so
+      # dist/ lands at the repo root (the SHA256SUMS step does `cd dist`).
       # -----------------------------------------------------------------------
       - name: Package release zip
         run: |
           IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
-          python3 tools/build.py \
+          uv run --project tools python tools/build.py \
             --runtime docker \
             --image "${IMAGE_REF}" \
             release \
@@ -353,7 +403,7 @@ jobs:
             --toolchain-versions toolchain-versions.json
 
       # -----------------------------------------------------------------------
-      # 8. SHA256SUMS — compute checksums over all release assets
+      # 11. SHA256SUMS — compute checksums over all release assets
       #
       # Covers the zip AND manifest.json so the cosign signature transitively
       # authenticates the build provenance record.
@@ -366,14 +416,14 @@ jobs:
           cat SHA256SUMS
 
       # -----------------------------------------------------------------------
-      # 9. Install cosign (keyless signing)
+      # 12. Install cosign (keyless signing)
       # -----------------------------------------------------------------------
       - name: Install cosign
         # sigstore/cosign-installer v3.7.0 — SHA-pinned.
         uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
 
       # -----------------------------------------------------------------------
-      # 10. Sign SHA256SUMS with cosign keyless
+      # 13. Sign SHA256SUMS with cosign keyless
       #
       # Uses ambient OIDC credentials (id-token: write) via GitHub Actions'
       # OIDC provider.  Produces SHA256SUMS.sig.
@@ -389,7 +439,7 @@ jobs:
             dist/SHA256SUMS
 
       # -----------------------------------------------------------------------
-      # 11. Determine pre-release status
+      # 14. Determine pre-release status
       #
       # A version is a prerelease if it contains an -alpha, -beta, or -rc suffix.
       # This is driven by the dispatch inputs (prerelease != 'no'), not by a
@@ -408,7 +458,7 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 12. Create GitHub Release and upload assets
+      # 15. Create GitHub Release and upload assets
       #
       # --generate-notes: auto-generates a changelog from merged PRs since the
       #                   previous tag.

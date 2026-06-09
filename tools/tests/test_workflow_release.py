@@ -11,8 +11,10 @@ New contract (nopal dispatch-button model):
   - prepare-version writes VERSION and creates a signed tag via the Git Data API.
   - release checks out the new tag, runs the submodule gate, pulls toolchain by
     digest (hard fail, no fallback, rejects all-zeros placeholder), runs repro-check,
-    packages, SHA256SUMs (covering manifest.json), cosign-signs (not continue-on-error),
-    and gh release create --generate-notes --fail-if-exists.
+    explicitly builds device artifacts, builds the v3ke CLI via the pinned Nim image,
+    sets up uv, packages under `uv run` (provides jsonschema), SHA256SUMs (covering
+    manifest.json), cosign-signs (not continue-on-error), and gh release create
+    --generate-notes --fail-if-exists.
   - NO continue-on-error anywhere.
   - NO inline toolchain-build fallback step.
   - Prerelease flag driven by -alpha/-beta/-rc suffix, NOT v0.* pattern.
@@ -24,6 +26,14 @@ Security-critical assertions:
   - All-zeros digest placeholder explicitly rejected.
   - sha256sum covers manifest.json.
   - gh release create has --generate-notes and --fail-if-exists.
+
+Integration-gap fixes (validated locally):
+  - tools/v3ke/v3ke is gitignored — must be built in the workflow via the pinned
+    Nim image before packaging (Build v3ke CLI step).
+  - build.py release requires jsonschema (pinned dev dep in tools/uv.lock) — the
+    package step must run under `uv run --project tools`, not bare python3.
+  - Device artifacts must be present at packaging time via an explicit build step,
+    not as a side effect of the repro gate.
 """
 
 from __future__ import annotations
@@ -363,6 +373,170 @@ def test_repro_gate_before_packaging(release_steps: list[dict]):
         f"repro-gate step (index {repro_idx}) must precede the packaging step "
         f"(index {pkg_idx}); a non-reproducible build must never be packaged"
     )
+
+
+# ---------------------------------------------------------------------------
+# release job — explicit device artifact build (ordering)
+# ---------------------------------------------------------------------------
+
+
+def test_artifacts_build_step_present(release_steps: list[dict]):
+    """
+    The release job must have an explicit step that runs `build.py … artifacts`
+    to build device artifacts.  Packaging must not rely on the repro gate's side
+    effects — those builds target a temp directory; an explicit artifacts step
+    guarantees the expected files are present at their standard paths when the
+    package step runs.
+    """
+    found = steps_contain(release_steps, "build.py", "artifacts")
+    assert found, (
+        "release job must have a step that runs build.py … artifacts "
+        "(explicit device artifact build, not a side effect of repro-check)"
+    )
+
+
+def test_artifacts_build_after_repro_gate(release_steps: list[dict]):
+    """
+    The explicit artifacts build step must appear AFTER the repro gate and
+    BEFORE the packaging step.
+
+    After: the repro gate has already pulled the image and validated
+    reproducibility; the artifacts build reuses the same pulled image.
+    Before: packaging requires the built artifacts to be present.
+    """
+    repro_idx = step_index(release_steps, "repro-check.sh")
+    artifacts_idx = step_index(release_steps, "build.py", "artifacts")
+    pkg_idx = step_index(release_steps, "build.py", "release")
+
+    assert repro_idx != -1, "No repro-gate step found (scripts/repro-check.sh)"
+    assert artifacts_idx != -1, "No artifacts build step found (build.py … artifacts)"
+    assert pkg_idx != -1, "No packaging step found (build.py … release)"
+
+    assert repro_idx < artifacts_idx, (
+        f"artifacts build step (index {artifacts_idx}) must come AFTER the repro gate "
+        f"(index {repro_idx})"
+    )
+    assert artifacts_idx < pkg_idx, (
+        f"artifacts build step (index {artifacts_idx}) must come BEFORE the packaging step "
+        f"(index {pkg_idx})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# release job — v3ke CLI build (integration gap fix)
+# ---------------------------------------------------------------------------
+
+
+def test_v3ke_cli_build_step_present(release_steps: list[dict]):
+    """
+    The release job must build the v3ke CLI binary before packaging.
+
+    tools/v3ke/v3ke is gitignored (compiled output) and is never present on a
+    fresh checkout.  It must be produced here by running `nimble build` inside
+    the pinned Nim image; otherwise the package step will fail when it tries to
+    include the binary in the release zip.
+    """
+    found = steps_contain(release_steps, "ghcr.io/coreyleavitt/nim", "nimble build")
+    assert found, (
+        "release job must build the v3ke CLI (nimble build inside "
+        "ghcr.io/coreyleavitt/nim image) before packaging.\n"
+        "tools/v3ke/v3ke is gitignored and absent on a fresh checkout."
+    )
+
+
+def test_v3ke_cli_build_before_packaging(release_steps: list[dict]):
+    """
+    The v3ke CLI build step must appear BEFORE the package step.
+    The binary must exist at tools/v3ke/v3ke when build.py release runs.
+    """
+    nim_idx = step_index(release_steps, "ghcr.io/coreyleavitt/nim", "nimble build")
+    pkg_idx = step_index(release_steps, "build.py", "release")
+
+    assert nim_idx != -1, (
+        "No v3ke CLI build step found "
+        "(ghcr.io/coreyleavitt/nim + nimble build) in release job"
+    )
+    assert pkg_idx != -1, "No packaging step found (build.py … release) in release job"
+    assert nim_idx < pkg_idx, (
+        f"v3ke CLI build step (index {nim_idx}) must come BEFORE the packaging step "
+        f"(index {pkg_idx}); the binary must exist when build.py release runs"
+    )
+
+
+# ---------------------------------------------------------------------------
+# release job — uv setup + package step runs under uv run (integration gap fix)
+# ---------------------------------------------------------------------------
+
+
+def test_setup_uv_step_present(release_steps: list[dict]):
+    """
+    The release job must install uv via astral-sh/setup-uv (SHA-pinned) before the
+    package step.  uv provisions the locked dev deps from tools/uv.lock, including
+    jsonschema, which build.py release requires for manifest validation.
+    Running the package step under bare python3 fails because jsonschema is not
+    installed in the system Python on ubuntu-latest.
+    """
+    found = steps_contain(release_steps, "astral-sh/setup-uv")
+    assert found, (
+        "release job must set up uv via astral-sh/setup-uv before the package step "
+        "so jsonschema (tools/uv.lock) is available for manifest validation"
+    )
+
+
+def test_setup_uv_sha_pinned(release_steps: list[dict]):
+    """astral-sh/setup-uv in the release job must be SHA-pinned (supply-chain safety)."""
+    for step in release_steps:
+        if "astral-sh/setup-uv" in step.get("uses", ""):
+            assert_uses_sha_pinned(step)
+            return
+    pytest.fail("No astral-sh/setup-uv step found in release job")
+
+
+def test_setup_uv_before_packaging(release_steps: list[dict]):
+    """
+    The uv setup step must appear BEFORE the package step.
+    uv must be on PATH when the `uv run` command executes.
+    """
+    uv_idx = step_index(release_steps, "astral-sh/setup-uv")
+    pkg_idx = step_index(release_steps, "build.py", "release")
+
+    assert uv_idx != -1, "No astral-sh/setup-uv step found in release job"
+    assert pkg_idx != -1, "No packaging step found (build.py … release) in release job"
+    assert uv_idx < pkg_idx, (
+        f"setup-uv step (index {uv_idx}) must come BEFORE the packaging step "
+        f"(index {pkg_idx})"
+    )
+
+
+def test_package_step_uses_uv_run(release_steps: list[dict]):
+    """
+    The package step must run under `uv run --project tools` rather than bare python3.
+    This provisions jsonschema from tools/uv.lock; bare python3 on ubuntu-latest
+    does not have jsonschema, causing build.py release to fail at manifest validation.
+    """
+    found = steps_contain(release_steps, "uv run", "build.py", "release")
+    assert found, (
+        "The package step must use 'uv run' to invoke build.py release.\n"
+        "Bare python3 lacks jsonschema (a pinned dep in tools/uv.lock).\n"
+        "Expected: uv run --project tools python tools/build.py … release …"
+    )
+
+
+def test_package_step_not_bare_python3(release_steps: list[dict]):
+    """
+    The package step must NOT invoke build.py release via bare python3.
+    Bare python3 is missing jsonschema; use `uv run --project tools` instead.
+    """
+    for step in release_steps:
+        run = str(step.get("run", ""))
+        if "build.py" in run and "release" in run and "--reproducible" in run:
+            assert "uv run" in run, (
+                "Package step invokes build.py release but does not use `uv run`.\n"
+                "Change: python3 tools/build.py → uv run --project tools python tools/build.py\n"
+                f"Step run:\n{run}"
+            )
+            return
+    pytest.fail("No packaging step found (build.py … release … --reproducible) in release job")
 
 
 # ---------------------------------------------------------------------------
