@@ -4,7 +4,7 @@
 # toolchain image.  CI pulls the image strictly by this digest (no inline-
 # build fallback).  The grep pattern used by CI is:
 #
-#   grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1
+#   grep -E '^sha256:[0-9a-f]{{64}}$' toolchain/IMAGE_DIGEST | head -1
 #
 # Do not edit manually; run: python3 tools/build.py --image <ref> image --push
-sha256:0000000000000000000000000000000000000000000000000000000000000000
+sha256:b004a8764ba5dfb68645d92972f9d14642e299a395f12fc756bc2af9b62936aa
