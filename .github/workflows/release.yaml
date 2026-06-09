@@ -462,9 +462,9 @@ jobs:
       #
       # --generate-notes: auto-generates a changelog from merged PRs since the
       #                   previous tag.
-      # --fail-if-exists: idempotency guard — prevents silently overwriting an
-      #                   existing release if the tag is somehow reused.
       # --prerelease:     set when the version has an -alpha/-beta/-rc suffix.
+      # Idempotency: gh release create already errors if a release for the tag
+      # exists, so no extra flag is needed (there is no --fail-if-exists flag).
       # Assets: zip, SHA256SUMS, SHA256SUMS.sig, manifest.json.
       # -----------------------------------------------------------------------
       - name: Create GitHub Release
@@ -478,7 +478,6 @@ jobs:
           fi
           gh release create "${TAG}" \
             --generate-notes \
-            --fail-if-exists \
             ${PRERELEASE_FLAG} \
             dist/v3ke-*-linux-amd64.zip \
             dist/SHA256SUMS \

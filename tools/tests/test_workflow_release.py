@@ -14,7 +14,7 @@ New contract (nopal dispatch-button model):
     explicitly builds device artifacts, builds the v3ke CLI via the pinned Nim image,
     sets up uv, packages under `uv run` (provides jsonschema), SHA256SUMs (covering
     manifest.json), cosign-signs (not continue-on-error), and gh release create
-    --generate-notes --fail-if-exists.
+    --generate-notes.
   - NO continue-on-error anywhere.
   - NO inline toolchain-build fallback step.
   - Prerelease flag driven by -alpha/-beta/-rc suffix, NOT v0.* pattern.
@@ -25,7 +25,7 @@ Security-critical assertions:
   - repro-gate precedes packaging (ordering).
   - All-zeros digest placeholder explicitly rejected.
   - sha256sum covers manifest.json.
-  - gh release create has --generate-notes and --fail-if-exists.
+  - gh release create has --generate-notes (and must NOT pass the invalid --fail-if-exists).
 
 Integration-gap fixes (validated locally):
   - tools/v3ke/v3ke is gitignored — must be built in the workflow via the pinned
@@ -621,12 +621,14 @@ def test_gh_release_create_generate_notes(release_steps: list[dict]):
     )
 
 
-def test_gh_release_create_fail_if_exists(release_steps: list[dict]):
-    """--fail-if-exists prevents silently overwriting an existing release."""
+def test_gh_release_create_no_invalid_fail_if_exists(release_steps: list[dict]):
+    """Must NOT pass --fail-if-exists: it is not a real `gh release create` flag
+    (gh errors on an existing release by default). Passing it makes gh print
+    usage and exit 1, failing the publish step."""
     found = steps_contain(release_steps, "gh release create", "--fail-if-exists")
-    assert found, (
-        "'gh release create' must include --fail-if-exists "
-        "(idempotency guard against re-pushed tags)"
+    assert not found, (
+        "'gh release create' must not pass --fail-if-exists — it is not a valid "
+        "flag and aborts the release; gh already fails if the release exists"
     )
 
 
