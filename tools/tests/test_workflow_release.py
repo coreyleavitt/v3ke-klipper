@@ -1,18 +1,29 @@
 """
-release.yml specifics — hermetic, offline.
+release.yaml specifics — hermetic, offline.
 
-Covers only release.yml structure.  Cross-workflow invariants (schema, SHA-pins,
+Covers only release.yaml structure.  Cross-workflow invariants (schema, SHA-pins,
 top-perms, no-write-all) are in test_workflows_common.py.
 
-Security-critical assertions here:
-  - Release job permissions are EXACTLY contents:write + id-token:write + packages:read
-    (nothing broader — enforces the principle of least privilege for release signing).
-  - cosign sign step is NOT continue-on-error (signing failure must abort the release).
-  - repro-gate step (repro-check.sh) precedes the packaging step (ordering matters).
-  - --prerelease is conditionally set for v0.* tags.
-  - gh release create uses --generate-notes + --fail-if-exists.
-  - SHA256SUMS computation covers manifest.json (cosign signature transitively
-    authenticates build provenance).
+New contract (nopal dispatch-button model):
+  - workflow_dispatch ONLY (no tag-push trigger — the workflow CREATES the tag).
+  - Two jobs: prepare-version (contents:write) + release (contents:write,
+    id-token:write, packages:read).
+  - prepare-version writes VERSION and creates a signed tag via the Git Data API.
+  - release checks out the new tag, runs the submodule gate, pulls toolchain by
+    digest (hard fail, no fallback, rejects all-zeros placeholder), runs repro-check,
+    packages, SHA256SUMs (covering manifest.json), cosign-signs (not continue-on-error),
+    and gh release create --generate-notes --fail-if-exists.
+  - NO continue-on-error anywhere.
+  - NO inline toolchain-build fallback step.
+  - Prerelease flag driven by -alpha/-beta/-rc suffix, NOT v0.* pattern.
+
+Security-critical assertions:
+  - Release job permissions EXACTLY: contents:write + id-token:write + packages:read.
+  - cosign sign step NOT continue-on-error.
+  - repro-gate precedes packaging (ordering).
+  - All-zeros digest placeholder explicitly rejected.
+  - sha256sum covers manifest.json.
+  - gh release create has --generate-notes and --fail-if-exists.
 """
 
 from __future__ import annotations
@@ -29,11 +40,12 @@ from _workflow_helpers import (
     load_workflow,
     repo_root,
     step_index,
+    step_run_text,
     steps_contain,
 )
 
 REPO_ROOT = repo_root()
-WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -43,10 +55,24 @@ def wf() -> dict:
 
 
 @pytest.fixture(scope="module")
+def prepare_version_job(wf: dict) -> dict:
+    jobs = wf.get("jobs", {})
+    assert "prepare-version" in jobs, (
+        f"No 'prepare-version' job in release.yaml; jobs: {list(jobs)}"
+    )
+    return jobs["prepare-version"]
+
+
+@pytest.fixture(scope="module")
 def release_job(wf: dict) -> dict:
     jobs = wf.get("jobs", {})
-    assert "release" in jobs, f"No 'release' job in release.yml; jobs: {list(jobs)}"
+    assert "release" in jobs, f"No 'release' job in release.yaml; jobs: {list(jobs)}"
     return jobs["release"]
+
+
+@pytest.fixture(scope="module")
+def prepare_version_steps(prepare_version_job: dict) -> list[dict]:
+    return prepare_version_job.get("steps", [])
 
 
 @pytest.fixture(scope="module")
@@ -55,29 +81,156 @@ def release_steps(release_job: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Triggers
+# Triggers: workflow_dispatch ONLY — no tag-push trigger
 # ---------------------------------------------------------------------------
 
 
-def test_trigger_push_tags_v_star(wf: dict):
-    """release.yml must fire on push to v* tags."""
+def test_trigger_workflow_dispatch_present(wf: dict):
+    """release.yaml must have workflow_dispatch (the dispatch-button release model)."""
+    assert "workflow_dispatch" in get_triggers(wf), (
+        "release.yaml must have a workflow_dispatch trigger"
+    )
+
+
+def test_trigger_no_tag_push(wf: dict):
+    """
+    release.yaml must NOT have a push/tags trigger.
+    The workflow itself creates the tag — a tag-push trigger would create an infinite loop
+    and also violates the dispatch-button model where humans control when releases happen.
+    """
     push = get_triggers(wf).get("push", {}) or {}
     tags = push.get("tags", [])
-    assert any("v*" in str(t) for t in tags), (
-        f"release.yml push trigger must include a 'v*' tag pattern; got: {tags}"
+    assert len(tags) == 0, (
+        f"release.yaml must NOT have a tag-push trigger (the workflow creates the tag); "
+        f"got push.tags: {tags}"
     )
 
 
-def test_trigger_workflow_dispatch(wf: dict):
-    """workflow_dispatch allows dry-run without pushing a real tag."""
-    assert "workflow_dispatch" in get_triggers(wf), (
-        "release.yml must have a workflow_dispatch trigger"
+def test_trigger_bump_input_present(wf: dict):
+    """workflow_dispatch must have a 'bump' choice input (none/patch/minor/major/stable)."""
+    dispatch = get_triggers(wf).get("workflow_dispatch", {}) or {}
+    inputs = dispatch.get("inputs", {}) or {}
+    assert "bump" in inputs, (
+        f"workflow_dispatch must have a 'bump' input; inputs: {list(inputs)}"
+    )
+    bump = inputs["bump"]
+    assert bump.get("type") == "choice", (
+        f"'bump' input must be type: choice; got: {bump.get('type')!r}"
+    )
+    expected_options = {"none", "patch", "minor", "major", "stable"}
+    actual_options = set(bump.get("options", []))
+    assert expected_options == actual_options, (
+        f"'bump' input options must be {expected_options}; got: {actual_options}"
+    )
+
+
+def test_trigger_prerelease_input_present(wf: dict):
+    """workflow_dispatch must have a 'prerelease' choice input (no/alpha/beta/rc)."""
+    dispatch = get_triggers(wf).get("workflow_dispatch", {}) or {}
+    inputs = dispatch.get("inputs", {}) or {}
+    assert "prerelease" in inputs, (
+        f"workflow_dispatch must have a 'prerelease' input; inputs: {list(inputs)}"
+    )
+    pr_input = inputs["prerelease"]
+    assert pr_input.get("type") == "choice", (
+        f"'prerelease' input must be type: choice; got: {pr_input.get('type')!r}"
+    )
+    expected_options = {"no", "alpha", "beta", "rc"}
+    actual_options = set(pr_input.get("options", []))
+    assert expected_options == actual_options, (
+        f"'prerelease' input options must be {expected_options}; got: {actual_options}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Release job permissions — EXACT least-privilege set (security-critical)
+# prepare-version job
 # ---------------------------------------------------------------------------
+
+
+def test_prepare_version_job_permissions(prepare_version_job: dict):
+    """prepare-version job must have contents: write (to push the version commit + tag)."""
+    perms = prepare_version_job.get("permissions", {})
+    assert perms.get("contents") == "write", (
+        f"prepare-version job must have contents: write; got: {perms}"
+    )
+
+
+def test_prepare_version_writes_version_file(prepare_version_steps: list[dict]):
+    """
+    prepare-version must write the VERSION file.
+    The signed commit created via the Git Data API must include the updated VERSION file.
+    """
+    found = steps_contain(prepare_version_steps, "VERSION")
+    assert found, (
+        "prepare-version job must have a step that writes the VERSION file"
+    )
+
+
+def test_prepare_version_creates_tag_via_git_data_api(prepare_version_steps: list[dict]):
+    """
+    prepare-version must create the release tag via the GitHub Git Data API
+    (gh api .../git/refs POST), yielding a 'Verified' commit using only GITHUB_TOKEN.
+    This is the nopal pattern: signed commits without a bot GPG key.
+    """
+    # The tag creation call: POST to /git/refs with ref="refs/tags/..."
+    found = steps_contain(prepare_version_steps, "git/refs")
+    assert found, (
+        "prepare-version must create the tag via the GitHub Git Data API "
+        "(gh api .../git/refs) — the nopal signed-commit pattern"
+    )
+
+
+def test_prepare_version_creates_commit_via_git_data_api(prepare_version_steps: list[dict]):
+    """
+    prepare-version must create a commit via the Git Data API
+    (gh api .../git/commits) so the release commit is 'Verified' on GitHub.
+    """
+    found = steps_contain(prepare_version_steps, "git/commits")
+    assert found, (
+        "prepare-version must create a signed commit via gh api .../git/commits"
+    )
+
+
+def test_prepare_version_outputs_version_tag_commit_sha(prepare_version_job: dict):
+    """
+    prepare-version job must declare outputs: version, tag, commit_sha
+    so the release job can check out the exact new commit.
+    """
+    outputs = prepare_version_job.get("outputs", {}) or {}
+    for key in ("version", "tag", "commit_sha"):
+        assert key in outputs, (
+            f"prepare-version job must declare output '{key}'; outputs: {list(outputs)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# release job — structure
+# ---------------------------------------------------------------------------
+
+
+def test_release_job_needs_prepare_version(release_job: dict):
+    """release job must declare needs: prepare-version."""
+    needs = release_job.get("needs", [])
+    if isinstance(needs, str):
+        needs = [needs]
+    assert "prepare-version" in needs, (
+        f"release job must need prepare-version; needs: {needs}"
+    )
+
+
+def test_release_job_checkouts_new_tag(release_steps: list[dict]):
+    """
+    The checkout in the release job must use the tag/commit produced by prepare-version,
+    not the triggering ref.  This guarantees the release builds from the version-bumped commit.
+    """
+    checkout_step = find_step_by_uses_prefix(release_steps, "actions/checkout")
+    assert checkout_step is not None, "release job must have a checkout step"
+    with_block = checkout_step.get("with", {}) or {}
+    ref = str(with_block.get("ref", ""))
+    assert "prepare-version" in ref, (
+        f"release job checkout must use needs.prepare-version.outputs.tag (or commit_sha); "
+        f"got ref: {ref!r}"
+    )
 
 
 def test_release_job_permissions_exact(release_job: dict):
@@ -86,7 +239,7 @@ def test_release_job_permissions_exact(release_job: dict):
       contents: write  — create the GitHub Release and upload assets
       id-token: write  — cosign keyless OIDC signing (ambient credentials)
       packages: read   — pull the toolchain image from ghcr
-    Any broader write grant would violate least-privilege for a release job.
+    Any broader write grant violates least-privilege.
     """
     perms = release_job.get("permissions", {})
     assert perms.get("contents") == "write", (
@@ -109,7 +262,86 @@ def test_release_job_permissions_exact(release_job: dict):
 
 
 # ---------------------------------------------------------------------------
-# Repro gate precedes packaging (ordering assertion — security-critical)
+# release job — submodule integrity gate
+# ---------------------------------------------------------------------------
+
+
+def test_submodule_integrity_gate_present(release_steps: list[dict]):
+    """The release job must include a submodule integrity gate (git submodule status)."""
+    found = steps_contain(release_steps, "git submodule status --recursive")
+    assert found, (
+        "release job must have a submodule integrity gate "
+        "('git submodule status --recursive' + check for +/-/U prefixes)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# release job — toolchain image pull (hard fail, no fallback, rejects zeros)
+# ---------------------------------------------------------------------------
+
+
+def test_no_continue_on_error_anywhere(wf: dict):
+    """
+    NO step in any job may have continue-on-error: true.
+    The old release.yml had continue-on-error on the digest-pull step to support
+    an inline-build fallback — that pattern is explicitly banned in release.yaml.
+    Every failure must abort the release.
+    """
+    for job_name, job in wf.get("jobs", {}).items():
+        for step in job.get("steps", []):
+            coe = step.get("continue-on-error")
+            assert coe is not True, (
+                f"Job '{job_name}', step '{step.get('name', step.get('id', '<unnamed>'))}' "
+                f"has continue-on-error: true — forbidden in release.yaml.\n"
+                f"Every failure must abort the release; no silent skips."
+            )
+
+
+def test_no_inline_toolchain_build_fallback(wf: dict):
+    """
+    release.yaml must NOT contain an inline toolchain-build fallback step
+    (no step that builds from toolchain/Containerfile as a fallback).
+    If the digest pull fails, the job must fail — full stop.
+    Operators must run 'build.py image --push' before triggering a release.
+    """
+    for job_name, job in wf.get("jobs", {}).items():
+        for step in job.get("steps", []):
+            run_text = str(step.get("run", ""))
+            # Detect a conditional inline build: if-gated on pull outcome + Containerfile build
+            if_cond = str(step.get("if", ""))
+            if "Containerfile" in run_text and "toolchain" in run_text.lower():
+                pytest.fail(
+                    f"Job '{job_name}', step '{step.get('name', '<unnamed>')}' "
+                    f"appears to be an inline toolchain-build fallback.\n"
+                    f"release.yaml must hard-fail when the digest pull fails — no fallback builds.\n"
+                    f"run snippet: {run_text[:200]!r}"
+                )
+
+
+def test_digest_pull_rejects_all_zeros_placeholder(release_steps: list[dict]):
+    """
+    The digest-pull step must explicitly reject the all-zeros placeholder
+    (sha256:0000…0) and emit a clear error directing the operator to run
+    'build.py image --push' first.
+    This prevents accidentally releasing with an unbuilt or unverified image.
+    """
+    for step in release_steps:
+        run = str(step.get("run", ""))
+        if "IMAGE_DIGEST" in run and "docker pull" in run:
+            assert "0000" in run or "00000" in run, (
+                f"The digest-pull step must explicitly reject the all-zeros placeholder "
+                f"(sha256:000...0).\n"
+                f"Add a check like: if echo \"$DIGEST\" | grep -q '^sha256:0{{64}}$'; then exit 1.\n"
+                f"Step run:\n{run}"
+            )
+            return
+    pytest.fail(
+        "No step found that reads IMAGE_DIGEST and does 'docker pull' in the release job"
+    )
+
+
+# ---------------------------------------------------------------------------
+# release job — repro gate precedes packaging (ordering — security-critical)
 # ---------------------------------------------------------------------------
 
 
@@ -117,7 +349,7 @@ def test_repro_gate_before_packaging(release_steps: list[dict]):
     """
     The repro-gate step (scripts/repro-check.sh) must appear BEFORE the packaging
     step (build.py … release).  A non-reproducible build must never be packaged or
-    published; the gate must abort the job on sha256 divergence.
+    published.
     """
     repro_idx = step_index(release_steps, "repro-check.sh")
     pkg_idx = step_index(release_steps, "build.py", "release")
@@ -134,7 +366,7 @@ def test_repro_gate_before_packaging(release_steps: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# SHA256SUMS covers manifest.json
+# release job — SHA256SUMS covers manifest.json
 # ---------------------------------------------------------------------------
 
 
@@ -159,15 +391,12 @@ def test_sha256sums_covers_manifest_json(release_steps: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# cosign: installed via SHA-pinned action + sign step NOT continue-on-error
+# release job — cosign: SHA-pinned installer + sign NOT continue-on-error
 # ---------------------------------------------------------------------------
 
 
 def test_cosign_installed_via_sha_pinned_action(release_steps: list[dict]):
-    """
-    cosign must be installed via sigstore/cosign-installer (SHA-pinned).
-    The installer action puts the cosign binary on PATH without a separate download step.
-    """
+    """cosign must be installed via sigstore/cosign-installer (SHA-pinned)."""
     found = steps_contain(release_steps, "sigstore/cosign-installer")
     assert found, (
         "release job must install cosign via sigstore/cosign-installer (SHA-pinned action)"
@@ -182,8 +411,6 @@ def test_cosign_sign_step_not_continue_on_error(release_steps: list[dict]):
     """
     The cosign sign-blob step must NOT be continue-on-error: true.
     Signing failure must abort the release — releasing unsigned assets is not permitted.
-    This is a hard supply-chain invariant: if the OIDC token is unavailable or cosign
-    fails for any reason, the release must stop rather than publish unsigned files.
     """
     for step in release_steps:
         if "cosign sign-blob" in str(step.get("run", "")):
@@ -207,7 +434,7 @@ def test_cosign_sign_produces_sha256sums_sig(release_steps: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# gh release create — flags and pre-release handling
+# release job — gh release create flags + prerelease logic
 # ---------------------------------------------------------------------------
 
 
@@ -229,19 +456,46 @@ def test_gh_release_create_fail_if_exists(release_steps: list[dict]):
     )
 
 
-def test_prerelease_flag_conditional_on_v0(release_steps: list[dict]):
+def test_prerelease_flag_driven_by_suffix_not_v0(release_steps: list[dict]):
     """
-    The --prerelease flag must be conditionally set for v0.* tags.
-    Tags matching v0.* are pre-1.0 and must be marked as pre-releases on GitHub.
+    The --prerelease flag must be driven by the presence of an -alpha/-beta/-rc suffix
+    in the version, NOT by the old 'v0.*' pattern.
+    The dispatch-button model uses explicit prerelease inputs; v0.* detection is obsolete.
     """
-    found_v0_check = any(
-        "v0." in str(s.get("run", "")) or "v0." in str(s.get("env", ""))
+    # Assert the new suffix-based check is present
+    suffix_check = any(
+        any(label in str(s.get("run", "")) for label in ("alpha", "beta", "rc"))
         for s in release_steps
     )
-    assert found_v0_check, (
-        "release job must check for v0.* tag pattern to set --prerelease conditionally"
+    assert suffix_check, (
+        "release job must check for -alpha/-beta/-rc suffix to set --prerelease "
+        "(not the old v0.* pattern)"
     )
-    found_prerelease = steps_contain(release_steps, "--prerelease")
-    assert found_prerelease, (
-        "release job must use --prerelease flag (conditionally for v0.* tags)"
+    # Assert the old v0.* pattern is NOT used
+    v0_check = any(
+        "v0." in str(s.get("run", "")) or "'^v0\\." in str(s.get("run", ""))
+        for s in release_steps
     )
+    assert not v0_check, (
+        "release job must NOT use the v0.* pattern to detect pre-releases.\n"
+        "Use the -alpha/-beta/-rc suffix from the version string instead."
+    )
+
+
+def test_gh_release_create_uses_tag_from_prepare_version(release_steps: list[dict]):
+    """
+    gh release create must use the tag produced by prepare-version
+    (needs.prepare-version.outputs.tag), not GITHUB_REF_NAME.
+    The release job is triggered by dispatch, not a tag push — GITHUB_REF_NAME
+    would be 'main', not the release tag.
+    """
+    for step in release_steps:
+        run = str(step.get("run", ""))
+        if "gh release create" in run:
+            assert "GITHUB_REF_NAME" not in run, (
+                "gh release create must NOT use GITHUB_REF_NAME in release.yaml.\n"
+                "The workflow is dispatch-triggered; use needs.prepare-version.outputs.tag instead.\n"
+                f"Step run:\n{run}"
+            )
+            return
+    pytest.fail("No 'gh release create' step found in the release job")

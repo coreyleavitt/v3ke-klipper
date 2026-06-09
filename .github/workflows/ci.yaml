@@ -3,9 +3,6 @@ name: CI
 # Runs on every push and pull request so failures surface before merge.
 # workflow_dispatch allows manual re-runs (useful when a runner is flaky or
 # a test is under active debugging without pushing a new commit).
-#
-# B3 (build job) and B4 (repro job) will be added to this file as additional
-# jobs once their slices land; only the test job is authored now.
 on:
   push:
     branches:
@@ -18,8 +15,7 @@ on:
 permissions: {}
 
 # No concurrency cancellation for the test job: cancelling tests on rapid pushes
-# can mask failures.  Build/repro jobs (B3/B4) will add their own concurrency
-# groups when they land, per the RFC trigger matrix.
+# can mask failures.  Build/repro jobs have their own gating via if: conditions.
 
 jobs:
   test:
@@ -142,9 +138,12 @@ jobs:
   #
   # Digest: sourced from toolchain/IMAGE_DIGEST (a repo-tracked file populated
   # by B0's first dispatch).  The image is pinned by digest — never by a moving
-  # tag — to ensure reproducibility.  Fallback: if the digest pull fails (e.g.
-  # before B0's first dispatch, or ghcr unavailable), the job builds the
-  # toolchain image inline from toolchain/Containerfile so CI is self-healing.
+  # tag — to ensure reproducibility.
+  #
+  # Hard-fail policy: if IMAGE_DIGEST holds the all-zeros placeholder or the pull
+  # fails, the job fails loudly.  There is NO continue-on-error and NO inline
+  # toolchain/Containerfile fallback.  Run 'build.py image --push' to publish
+  # the toolchain image before triggering this job.
   # ---------------------------------------------------------------------------
   build:
     name: Build artifacts + ABI-verify (v3ke-toolchain)
@@ -172,6 +171,31 @@ jobs:
           submodules: recursive
 
       # ---------------------------------------------------------------------------
+      # Submodule integrity gate
+      #
+      # Same gate as the test job — catches +/-/U prefix drift before the expensive
+      # 61 GB toolchain build starts.  A force-pushed upstream submodule tag would
+      # otherwise silently swap pinned source without detection.
+      # ---------------------------------------------------------------------------
+      - name: Submodule integrity gate
+        run: |
+          echo "--- git submodule status --recursive ---"
+          git submodule status --recursive
+          bad=$(git submodule status --recursive | grep -E '^\s*[+\-U]' || true)
+          if [ -n "$bad" ]; then
+            echo "ERROR: submodule(s) out-of-sync with pinned index commits:"
+            echo "$bad"
+            echo ""
+            echo "  '+' = checked-out commit differs from index (stale or rebased upstream)"
+            echo "  '-' = submodule not initialized"
+            echo "  'U' = merge conflict inside submodule"
+            echo ""
+            echo "Fix: git submodule update --init --recursive  (then commit the result)"
+            exit 1
+          fi
+          echo "OK: all submodules match their pinned commits."
+
+      # ---------------------------------------------------------------------------
       # Log in to ghcr so we can pull the (possibly private) toolchain image.
       # docker/login-action v3.3.0 — SHA-pinned.
       # ---------------------------------------------------------------------------
@@ -183,76 +207,61 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # ---------------------------------------------------------------------------
-      # Pull the toolchain image by digest (reproducibility guarantee).
+      # Pull the toolchain image by digest — HARD FAIL, no fallback.
       #
-      # The digest is read from toolchain/IMAGE_DIGEST — a repo-tracked plain-text
-      # file (format: sha256:<64-hex>).  This file is updated after each B0 dispatch.
+      # The digest is read from toolchain/IMAGE_DIGEST (a repo-tracked plain-text
+      # file, format: sha256:<64-hex>).  This file is updated after each B0 dispatch.
       #
-      # TODO(B0-first-dispatch): until B0 has been dispatched, IMAGE_DIGEST holds a
-      # placeholder sha256:000…000 and the pull will fail — the fallback step below
-      # will then build the image inline.  After B0's first run, replace the
-      # placeholder with the real digest so the pull path is taken.
+      # Hard-fail policy:
+      #   - If IMAGE_DIGEST contains no valid sha256: line → exit 1 (clear error).
+      #   - If IMAGE_DIGEST contains the all-zeros placeholder (sha256:000…0) →
+      #     exit 1 with an operator-facing error pointing at 'build.py image --push'.
+      #   - If docker pull fails → the job fails.  No continue-on-error, no fallback.
       #
-      # The step id is 'pull' so the fallback step can condition on its outcome.
+      # Rationale: a build from an unverified inline image cannot carry the
+      # reproducibility guarantee.  Operators must run 'build.py image --push' to
+      # publish the toolchain image before triggering this job.
       # ---------------------------------------------------------------------------
       - name: Pull toolchain image by digest
         id: pull
         run: |
           DIGEST=$(grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1)
           if [ -z "$DIGEST" ]; then
-            echo "ERROR: no valid sha256: line found in toolchain/IMAGE_DIGEST" >&2
+            echo "ERROR: no valid sha256:<64-hex> line found in toolchain/IMAGE_DIGEST" >&2
+            echo "Run 'python3 tools/build.py image --push' to build and publish the toolchain image." >&2
+            exit 1
+          fi
+          # Reject the all-zeros placeholder (sha256:0000...0).
+          if echo "$DIGEST" | grep -qE '^sha256:0{64}$'; then
+            echo "ERROR: toolchain/IMAGE_DIGEST contains the all-zeros placeholder." >&2
+            echo "The toolchain image has not been built and pushed yet." >&2
+            echo "Run 'python3 tools/build.py image --push' to build and publish it," >&2
+            echo "then update toolchain/IMAGE_DIGEST with the real digest." >&2
             exit 1
           fi
           IMAGE_REF="ghcr.io/coreyleavitt/v3ke-toolchain@${DIGEST}"
-          echo "Pulling ${IMAGE_REF} …"
+          echo "Pulling ${IMAGE_REF} ..."
           docker pull "${IMAGE_REF}"
+          # Tag locally as v3ke-toolchain so build.py --image v3ke-toolchain finds it.
+          docker tag "${IMAGE_REF}" v3ke-toolchain
           # Export the ref so downstream steps can use the exact pulled image.
           echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
-        continue-on-error: true   # fallback step handles the pull-failure case
-
-      # ---------------------------------------------------------------------------
-      # Inline-build fallback: if the digest pull fails (ghcr unavailable, digest
-      # not yet published by B0), build the toolchain image from source.
-      # This makes the job self-healing; the resulting image is tagged locally so
-      # the build step below can use it identically.
-      #
-      # Warning: an inline toolchain build takes ~20-40 min.  After B0's first
-      # dispatch the pull will succeed and this step will be skipped.
-      # ---------------------------------------------------------------------------
-      - name: Build toolchain image inline (fallback — pull failed or digest not set)
-        if: steps.pull.outcome == 'failure'
-        run: |
-          echo "WARNING: digest pull failed — building toolchain image inline from toolchain/Containerfile"
-          docker build \
-            -t ghcr.io/coreyleavitt/v3ke-toolchain:ci-fallback \
-            -f toolchain/Containerfile \
-            toolchain/
-          echo "image_ref=ghcr.io/coreyleavitt/v3ke-toolchain:ci-fallback" >> "$GITHUB_OUTPUT"
-        id: fallback
 
       # ---------------------------------------------------------------------------
       # Build all device artifacts + ABI-verify inside the toolchain image.
       #
-      # Chooses the image ref from whichever step succeeded (pull or fallback).
-      # Invokes tools/build.py artifacts --runtime docker --image <ref>, which runs
-      # python3 -m build.orchestrate inside the container, builds the 4 artifacts
-      # (katapult.bin, klipper.bin, c_helper.so, klipper.elf), and ABI-verifies
-      # all ELF outputs (fp_abi=6 / FP64).  Exits non-zero on any failure or
-      # ABI violation — that exit code is this job's pass/fail.
+      # Invokes tools/build.py artifacts --runtime docker --image v3ke-toolchain,
+      # which runs python3 -m build.orchestrate inside the container, builds the 4
+      # artifacts (katapult.bin, klipper.bin, c_helper.so, klipper.elf), and
+      # ABI-verifies all ELF outputs (fp_abi=6 / FP64).  Exits non-zero on any
+      # failure or ABI violation — that exit code is this job's pass/fail.
       # ---------------------------------------------------------------------------
       - name: Build artifacts + ABI verify
         run: |
-          # Resolve the image ref: prefer the digest-pinned pull; fall back to
-          # the locally-built fallback tag.
-          if [ "${{ steps.pull.outcome }}" = "success" ]; then
-            IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
-          else
-            IMAGE_REF="${{ steps.fallback.outputs.image_ref }}"
-          fi
-          echo "Building artifacts in image: ${IMAGE_REF}"
+          echo "Building artifacts in image: v3ke-toolchain (pulled by digest)"
           python3 tools/build.py \
             --runtime docker \
-            --image "${IMAGE_REF}" \
+            --image v3ke-toolchain \
             artifacts
 
       # ---------------------------------------------------------------------------
@@ -286,11 +295,12 @@ jobs:
   #   schedules each matrix instance on a separate, independent runner.  Each
   #   instance:
   #     1. Checks out the repo (same commit, full history + submodules).
-  #     2. Logs in to ghcr and pulls the toolchain image BY DIGEST (same digest
+  #     2. Runs the submodule integrity gate.
+  #     3. Logs in to ghcr and pulls the toolchain image BY DIGEST (same digest
   #        for both instances, sourced from toolchain/IMAGE_DIGEST).
-  #     3. Builds all artifacts via ``build.py artifacts --runtime docker``.
+  #     4. Builds all artifacts via ``build.py artifacts --runtime docker``.
   #        No cache is mounted — each build is a true cold rebuild.
-  #     4. Uploads a sha256 manifest (sha256sum of the 4 artifacts) as a
+  #     5. Uploads a sha256 manifest (sha256sum of the 4 artifacts) as a
   #        named artifact: ``sha256-manifest-${{ matrix.run }}``.
   #
   #   After BOTH matrix instances complete, the ``repro-compare`` job (which
@@ -299,18 +309,8 @@ jobs:
   #   reports which artifact differed and installs + runs diffoscope for a
   #   detailed byte-level diff.
   #
-  # Cache policy:
-  #   No cache-from / cache-to flags are passed to docker build (only
-  #   ``docker pull`` + ``docker run`` are used).  The Python build module
-  #   starts each subproject with ``make clean``, so no object files from
-  #   build A can survive into build B.  This is the only correct proof:
-  #   a cache hit would mask non-determinism, not prove its absence.
-  #
-  # Digest:
-  #   Both instances pull ``ghcr.io/coreyleavitt/v3ke-toolchain@${DIGEST}``
-  #   where DIGEST is read from toolchain/IMAGE_DIGEST.  Using the same digest
-  #   ensures both builds use pixel-identical image layers; a mutable tag could
-  #   be re-pushed between the two matrix instances, invalidating the proof.
+  # Hard-fail policy: no continue-on-error, no inline-build fallback.  The digest
+  # pull must succeed or the job fails.
   # ---------------------------------------------------------------------------
   repro:
     name: "Reproducibility build ${{ matrix.run }}/2 (v3ke-toolchain)"
@@ -343,6 +343,30 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      # ---------------------------------------------------------------------------
+      # Submodule integrity gate
+      #
+      # Same gate as the test and build jobs — both matrix instances independently
+      # verify the submodule pins before the expensive build starts.
+      # ---------------------------------------------------------------------------
+      - name: Submodule integrity gate
+        run: |
+          echo "--- git submodule status --recursive ---"
+          git submodule status --recursive
+          bad=$(git submodule status --recursive | grep -E '^\s*[+\-U]' || true)
+          if [ -n "$bad" ]; then
+            echo "ERROR: submodule(s) out-of-sync with pinned index commits:"
+            echo "$bad"
+            echo ""
+            echo "  '+' = checked-out commit differs from index (stale or rebased upstream)"
+            echo "  '-' = submodule not initialized"
+            echo "  'U' = merge conflict inside submodule"
+            echo ""
+            echo "Fix: git submodule update --init --recursive  (then commit the result)"
+            exit 1
+          fi
+          echo "OK: all submodules match their pinned commits."
+
       - name: Log in to GitHub Container Registry
         # docker/login-action v3.3.0 — SHA-pinned.
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
@@ -352,17 +376,30 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # ---------------------------------------------------------------------------
-      # Pull the toolchain image by digest — same digest for BOTH instances.
+      # Pull the toolchain image by digest — HARD FAIL, no fallback.
       #
       # Reading the digest from toolchain/IMAGE_DIGEST (a repo-tracked file)
       # guarantees both matrix instances pull the identical image, even if a
       # new push to ghcr races between the two scheduler invocations.
+      #
+      # Hard-fail policy: if IMAGE_DIGEST holds the all-zeros placeholder or the
+      # pull fails, the job fails.  No continue-on-error, no inline-build fallback.
       # ---------------------------------------------------------------------------
       - name: Pull toolchain image by digest
+        id: pull
         run: |
           DIGEST=$(grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1)
           if [ -z "$DIGEST" ]; then
-            echo "ERROR: no valid sha256: line in toolchain/IMAGE_DIGEST" >&2
+            echo "ERROR: no valid sha256:<64-hex> line in toolchain/IMAGE_DIGEST" >&2
+            echo "Run 'python3 tools/build.py image --push' to build and publish the toolchain image." >&2
+            exit 1
+          fi
+          # Reject the all-zeros placeholder (sha256:0000...0).
+          if echo "$DIGEST" | grep -qE '^sha256:0{64}$'; then
+            echo "ERROR: toolchain/IMAGE_DIGEST contains the all-zeros placeholder." >&2
+            echo "The toolchain image has not been built and pushed yet." >&2
+            echo "Run 'python3 tools/build.py image --push' to build and publish it," >&2
+            echo "then update toolchain/IMAGE_DIGEST with the real digest." >&2
             exit 1
           fi
           IMAGE_REF="ghcr.io/coreyleavitt/v3ke-toolchain@${DIGEST}"
@@ -371,7 +408,6 @@ jobs:
           # Tag locally as v3ke-toolchain so build.py --image v3ke-toolchain finds it.
           docker tag "${IMAGE_REF}" v3ke-toolchain
           echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
-        id: pull
 
       # ---------------------------------------------------------------------------
       # Build all artifacts — no cache mounts, true cold rebuild.

@@ -3,9 +3,9 @@
 Slice C2: pure Python, offline. No container, no real git tag required.
 
 TDD order (each RED→GREEN):
-  C2-1:  resolve_version happy path
-  C2-2:  resolve_version loud failure (empty / non-v* / nonzero)
-  C2-3:  release_zip_name
+  C2-1:  resolve_version happy path (file-read contract)
+  C2-2:  resolve_version loud failure (file-read contract)
+  C2-3:  release_zip_name (bare version, no 'v' prefix in version arg)
   C2-4:  build_manifest shape
   C2-5:  validate_manifest valid passes
   C2-6:  validate_manifest invalid fails (missing field / bad sha256)
@@ -42,83 +42,58 @@ _EPOCH = 1_700_000_000  # fixed, no git required
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# C2-1: resolve_version — happy path
+# C2-1: resolve_version — happy path (file-read contract)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestResolveVersionHappy:
-    """resolve_version returns the stripped tag string when git describe succeeds."""
+    """resolve_version reads a VERSION file and returns a bare semver string."""
 
-    def test_returns_version_string(self):
-        def fake_runner(cmd):
-            return "v0.1.0-3-gabcdef012345\n"
+    def test_returns_bare_version(self, tmp_path):
+        (tmp_path / "VERSION").write_text("0.1.0\n")
+        assert resolve_version(tmp_path) == "0.1.0"
 
-        result = resolve_version(Path("/fake/repo"), runner=fake_runner)
-        assert result == "v0.1.0-3-gabcdef012345"
+    def test_strips_trailing_newline(self, tmp_path):
+        (tmp_path / "VERSION").write_text("1.2.3\n")
+        assert resolve_version(tmp_path) == "1.2.3"
 
-    def test_strips_trailing_newline(self):
-        def fake_runner(cmd):
-            return "v1.2.3\n"
-
-        result = resolve_version(Path("/fake/repo"), runner=fake_runner)
-        assert result == "v1.2.3"
-
-    def test_passes_correct_git_describe_cmd(self):
-        captured = []
-
-        def fake_runner(cmd):
-            captured.append(cmd)
-            return "v0.1.0\n"
-
-        resolve_version(Path("/the/repo"), runner=fake_runner)
-        assert captured[0] == [
-            "git", "-C", "/the/repo", "describe", "--match", "v*", "--abbrev=12"
-        ]
+    def test_returns_prerelease(self, tmp_path):
+        (tmp_path / "VERSION").write_text("0.2.0-rc.1\n")
+        assert resolve_version(tmp_path) == "0.2.0-rc.1"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# C2-2: resolve_version — loud failure
+# C2-2: resolve_version — loud failure (file-read contract)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestResolveVersionFailure:
-    """resolve_version raises ReleaseError for empty / non-v* / runner error."""
+    """resolve_version raises ReleaseError for missing/empty/malformed VERSION."""
 
-    def test_raises_on_empty_output(self):
-        def fake_runner(cmd):
-            return ""
+    def test_raises_on_missing_file(self, tmp_path):
+        with pytest.raises(ReleaseError, match="VERSION"):
+            resolve_version(tmp_path)
 
-        with pytest.raises(ReleaseError, match="git tag"):
-            resolve_version(Path("/repo"), runner=fake_runner)
-
-    def test_raises_on_whitespace_only(self):
-        def fake_runner(cmd):
-            return "  \n"
-
+    def test_raises_on_empty_file(self, tmp_path):
+        (tmp_path / "VERSION").write_text("")
         with pytest.raises(ReleaseError):
-            resolve_version(Path("/repo"), runner=fake_runner)
+            resolve_version(tmp_path)
 
-    def test_raises_on_non_v_prefix(self):
-        def fake_runner(cmd):
-            return "0.1.0\n"
-
-        with pytest.raises(ReleaseError, match="v\\*"):
-            resolve_version(Path("/repo"), runner=fake_runner)
-
-    def test_raises_on_runner_exception(self):
-        def fake_runner(cmd):
-            raise RuntimeError("git not found")
-
+    def test_raises_on_whitespace_only(self, tmp_path):
+        (tmp_path / "VERSION").write_text("  \n")
         with pytest.raises(ReleaseError):
-            resolve_version(Path("/repo"), runner=fake_runner)
+            resolve_version(tmp_path)
 
-    def test_error_message_mentions_bootstrap(self):
-        """The error message must name the one-time bootstrap step."""
-        def fake_runner(cmd):
-            return ""
+    def test_raises_on_v_prefix(self, tmp_path):
+        """File must be bare — v-prefix is rejected (CI writes bare semver)."""
+        (tmp_path / "VERSION").write_text("v0.1.0\n")
+        with pytest.raises(ReleaseError):
+            resolve_version(tmp_path)
 
+    def test_error_message_mentions_version_file(self, tmp_path):
+        """The error message must name the VERSION file and the prepare-version CI job."""
         with pytest.raises(ReleaseError) as exc_info:
-            resolve_version(Path("/repo"), runner=fake_runner)
+            resolve_version(tmp_path)
         msg = str(exc_info.value)
-        assert "git tag" in msg
+        assert "VERSION" in msg
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -127,10 +102,10 @@ class TestResolveVersionFailure:
 
 class TestReleaseZipName:
     def test_basic_version(self):
-        assert release_zip_name("v0.1.0") == "v3ke-v0.1.0-linux-amd64.zip"
+        assert release_zip_name("0.1.0") == "v3ke-0.1.0-linux-amd64.zip"
 
-    def test_with_git_describe_suffix(self):
-        assert release_zip_name("v0.1.0-3-gabcdef012345") == "v3ke-v0.1.0-3-gabcdef012345-linux-amd64.zip"
+    def test_prerelease_suffix(self):
+        assert release_zip_name("0.1.0-rc.1") == "v3ke-0.1.0-rc.1-linux-amd64.zip"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -161,7 +136,7 @@ class TestBuildManifestShape:
 
     def _make(self, **overrides):
         kwargs = dict(
-            version="v0.1.0",
+            version="0.1.0",
             commit="deadbeef" * 5,
             source_date_epoch=_EPOCH,
             toolchain=_SAMPLE_TOOLCHAIN,
@@ -181,8 +156,8 @@ class TestBuildManifestShape:
         assert m["schema_version"] == "1"
 
     def test_build_id_is_version(self):
-        m = self._make(version="v0.2.0")
-        assert m["build"]["id"] == "v0.2.0"
+        m = self._make(version="0.2.0")
+        assert m["build"]["id"] == "0.2.0"
 
     def test_build_commit(self):
         m = self._make(commit="abc123" * 6 + "ab")
@@ -232,7 +207,7 @@ def _valid_manifest() -> dict:
         "_type": "v3ke-build",
         "schema_version": "1",
         "build": {
-            "id": "v0.1.0",
+            "id": "0.1.0",
             "commit": "abc" * 13 + "a",
             "timestamp": "2023-11-14T22:13:20+00:00",
             "reproducible": False,
@@ -600,7 +575,7 @@ class TestWriteReleaseZip:
         zip_path = write_release_zip(
             repo_root=repo,
             out_dir=out_dir,
-            version="v0.1.0",
+            version="0.1.0",
             commit="deadbeef" * 5,
             source_date_epoch=_EPOCH,
             toolchain=_SAMPLE_TOOLCHAIN_VERSIONS,
@@ -619,7 +594,7 @@ class TestWriteReleaseZip:
 
     def test_zip_name_matches_convention(self, tmp_path):
         zip_path, _ = self._write_zip(tmp_path)
-        assert zip_path.name == "v3ke-v0.1.0-linux-amd64.zip"
+        assert zip_path.name == "v3ke-0.1.0-linux-amd64.zip"
 
     def test_zip_contains_install_md(self, tmp_path):
         zip_path, _ = self._write_zip(tmp_path)

@@ -26,6 +26,10 @@ REPO = Path(__file__).resolve().parent.parent          # tools/build.py -> repo 
 TOOLCHAIN = REPO / "toolchain"
 INSTALLED_GCC = "/opt/x-tools/mipsel-buildroot-linux-gnu/bin/mipsel-buildroot-linux-gnu-gcc"
 
+# Pure helpers + updated cmd_image live in build_main so they are unit-testable
+# without importing this CLI entry-point.
+from build_main import cmd_image, parse_repo_digest, write_image_digest  # noqa: E402
+
 
 def run(cmd):
     print("+ " + " ".join(map(str, cmd)), flush=True)
@@ -48,14 +52,6 @@ def require_image(image, runtime="podman"):
     if not image_exists(image, runtime=runtime):
         sys.exit(f"image '{image}' not found — run: build.py image")
 
-
-def cmd_image(a):
-    runtime = getattr(a, "runtime", "podman")
-    cmd = [runtime, "build", "-t", a.image, "-f", str(TOOLCHAIN / "Containerfile")]
-    if getattr(a, "ctng_version", None):
-        cmd += ["--build-arg", f"CTNG_VERSION={a.ctng_version}"]
-    cmd.append(str(TOOLCHAIN))
-    run(cmd)
 
 
 def cmd_snapshot(a):
@@ -177,6 +173,14 @@ def main():
 
     pi = sub.add_parser("image", help="build the toolchain image")
     pi.add_argument("--ctng-version", help="override crosstool-ng version (Containerfile build-arg)")
+    pi.add_argument(
+        "--push", action="store_true", default=False,
+        help=(
+            "after building, push the image to the registry, capture the registry "
+            "digest via 'inspect --format {{index .RepoDigests 0}}', and write it "
+            "to toolchain/IMAGE_DIGEST (for digest-pinned CI pulls)"
+        ),
+    )
 
     ps = sub.add_parser("snapshot", help="copy baked toolchain <-> named volume")
     ps.add_argument("action", nargs="?", choices=["backup", "restore"], default="backup")

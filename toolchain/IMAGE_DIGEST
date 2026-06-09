@@ -1,14 +1,10 @@
-# Toolchain image digest — populated by B0's first dispatch.
+# Toolchain image digest — managed by: build.py image --push
 #
-# Format: sha256:<64-hex-chars>
-# Source: the "Report image digest" step in .github/workflows/build-toolchain-image.yml
-#         prints the digest to the job summary and GITHUB_OUTPUT after each push.
+# This file is updated by the local operator after building and pushing the
+# toolchain image.  CI pulls the image strictly by this digest (no inline-
+# build fallback).  The grep pattern used by CI is:
 #
-# Usage in CI (B3 build job):
-#   IMAGE_REF=ghcr.io/coreyleavitt/v3ke-toolchain@$(cat toolchain/IMAGE_DIGEST)
-#   docker pull "$IMAGE_REF"  # pinned pull; falls back to inline build on failure
+#   grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1
 #
-# TODO(B0-first-dispatch): replace the placeholder below with the real digest once
-# B0's build-toolchain-image workflow has been dispatched for the first time and
-# the "Report image digest" step emits the sha256 value.
+# Do not edit manually; run: python3 tools/build.py --image <ref> image --push
 sha256:0000000000000000000000000000000000000000000000000000000000000000

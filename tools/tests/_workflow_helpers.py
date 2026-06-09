@@ -97,9 +97,10 @@ def assert_uses_sha_pinned(step: dict) -> None:
 
 
 def all_workflows() -> list[Path]:
-    """Return all .github/workflows/*.yml files in the repository."""
+    """Return all .github/workflows/*.yml and *.yaml files in the repository."""
     root = repo_root()
-    return sorted((root / ".github" / "workflows").glob("*.yml"))
+    wf_dir = root / ".github" / "workflows"
+    return sorted(list(wf_dir.glob("*.yml")) + list(wf_dir.glob("*.yaml")))
 
 
 def job_perms(workflow_yaml: dict, job_name: str) -> dict:

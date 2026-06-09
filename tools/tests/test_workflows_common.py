@@ -1,15 +1,15 @@
 """
-Shared workflow invariants — parametrized over every .github/workflows/*.yml file.
+Shared workflow invariants — parametrized over every .github/workflows/*.yaml file.
 
-Each test function is written once and exercised against all three workflow files
-(build-toolchain-image.yml, ci.yml, release.yml).  Invariants tested here:
+Each test function is written once and exercised against all workflow files
+(ci.yaml, release.yaml).  Invariants tested here:
   1. Schema-valid (offline vendored check-jsonschema).
   2. Every uses: is SHA-pinned (supply-chain / tag-mutation defence).
   3. Top-level permissions is {} (deny-by-default).
   4. No job (and no top-level) grants write-all.
 
-Per-workflow specifics live in test_workflow_toolchain_image.py, test_workflow_ci.py,
-and test_workflow_release.py.  DO NOT add per-workflow assertions here.
+Per-workflow specifics live in test_workflow_ci.py and test_workflow_release.py.
+DO NOT add per-workflow assertions here.
 """
 
 from __future__ import annotations

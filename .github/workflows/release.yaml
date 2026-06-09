@@ -1,0 +1,436 @@
+name: Release
+
+# Dispatch-button release model (nopal pattern):
+#   A maintainer triggers this workflow via workflow_dispatch, choosing how to
+#   bump the version and whether to label it as a prerelease.  The workflow
+#   itself writes VERSION, creates a signed commit via the GitHub Git Data API
+#   (yielding a "Verified" badge with only GITHUB_TOKEN — no bot GPG key needed),
+#   and pushes the release tag.  The release job then checks out that exact tag,
+#   proves reproducibility, packages, signs, and publishes.
+#
+# Why NO tag-push trigger:
+#   The workflow creates the tag.  A tag-push trigger would fire on the tag this
+#   workflow just created, starting an infinite loop.  It would also allow releasing
+#   from a non-dispatch ref (e.g. a CI tag from a branch), which is undesirable.
+#
+# Release pipeline:
+#   1. prepare-version — semver bump + signed commit/tag via Git Data API.
+#   2. release         — checkout new tag, submodule gate, pull toolchain by digest
+#                        (hard fail), repro-check, package, SHA256SUMS, cosign, publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type ("none" only increments the prerelease counter)'
+        required: true
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
+          - stable
+      prerelease:
+        description: 'Prerelease label (or "no" for a stable release)'
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - alpha
+          - beta
+          - rc
+
+# Deny all permissions by default; each job elevates only what it needs.
+permissions: {}
+
+# Prevent overlapping release runs on the same ref.
+# cancel-in-progress: true is safe here — a duplicate run would fail at
+# --fail-if-exists anyway, and cancelling is preferable to double-billing runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: prepare-version
+  #
+  # Reads the current VERSION file, applies the requested bump and prerelease
+  # label, writes the new bare semver back to VERSION, and creates a signed
+  # commit + tag via the GitHub Git Data API.  The resulting commit is marked
+  # "Verified" by GitHub because it was created through the API with GITHUB_TOKEN
+  # (which carries the app's signing identity) — no GPG key required.
+  # ---------------------------------------------------------------------------
+  prepare-version:
+    name: Prepare version and create signed tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      commit_sha: ${{ steps.version.outputs.commit_sha }}
+
+    steps:
+      - name: Checkout (full history)
+        # actions/checkout v4.2.2 — SHA-pinned to prevent tag-mutation attacks.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Compute version, write VERSION, create signed commit + tag
+        id: version
+        run: |
+          BUMP="${{ inputs.bump }}"
+          PRERELEASE="${{ inputs.prerelease }}"
+
+          # Read the current bare semver from VERSION (no v prefix, no trailing newline).
+          CURRENT=$(cat VERSION | tr -d '[:space:]')
+          echo "Current version: $CURRENT"
+
+          # Parse base (strip any existing prerelease suffix) and components.
+          BASE=$(echo "$CURRENT" | sed 's/-.*//')
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          PATCH=$(echo "$BASE" | cut -d. -f3)
+          CURRENT_PRE_TYPE=$(echo "$CURRENT" | sed -n 's/.*-\([a-z]*\)\.\([0-9]*\)$/\1/p')
+          CURRENT_PRE_NUM=$(echo "$CURRENT"  | sed -n 's/.*-\([a-z]*\)\.\([0-9]*\)$/\2/p')
+
+          # Validate input combinations.
+          if [ "$BUMP" = "none" ] && [ "$PRERELEASE" = "no" ]; then
+            echo "::error::bump=none requires a prerelease label (cannot bump nothing to stable)"
+            exit 1
+          fi
+          if [ "$BUMP" = "stable" ] && [ -z "$CURRENT_PRE_TYPE" ]; then
+            echo "::error::bump=stable requires the current version to be a prerelease"
+            exit 1
+          fi
+
+          # Apply the numeric bump.
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            stable|none) ;; # keep the base as-is
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+          # Apply the prerelease suffix.
+          if [ "$BUMP" = "stable" ] || [ "$PRERELEASE" = "no" ]; then
+            : # stable release — no suffix
+          elif [ "$BUMP" = "none" ] && [ "$CURRENT_PRE_TYPE" = "$PRERELEASE" ]; then
+            # Same prerelease type, increment the counter.
+            PRE_NUM=$((${CURRENT_PRE_NUM:-0} + 1))
+            NEW_VERSION="${NEW_VERSION}-${PRERELEASE}.${PRE_NUM}"
+          else
+            # New prerelease series, start at .1.
+            NEW_VERSION="${NEW_VERSION}-${PRERELEASE}.1"
+          fi
+
+          TAG="v${NEW_VERSION}"
+          echo "New version: $NEW_VERSION  →  tag: $TAG"
+
+          # Write VERSION (bare semver, no trailing newline).
+          printf '%s' "$NEW_VERSION" > VERSION
+
+          # ------------------------------------------------------------------
+          # Create a signed commit via the GitHub Git Data API (nopal pattern).
+          #
+          # Steps:
+          #   1. Upload the new VERSION content as a blob → BLOB_SHA.
+          #   2. Create a tree containing only the VERSION change → TREE_SHA.
+          #   3. Create a commit object pointing at TREE_SHA → COMMIT_SHA.
+          #   4. Fast-forward the branch ref to COMMIT_SHA (PATCH).
+          #   5. Create the release tag ref pointing at COMMIT_SHA (POST).
+          #
+          # The commit is signed by the GitHub Actions app identity associated
+          # with GITHUB_TOKEN — no GPG key or external bot required.
+          # ------------------------------------------------------------------
+
+          # 1. Upload VERSION as a blob.
+          BLOB_SHA=$(base64 -w 0 VERSION | \
+            jq -Rs '{content: ., encoding: "base64"}' | \
+            gh api "repos/${{ github.repository }}/git/blobs" \
+              --input - \
+              --jq '.sha')
+
+          # 2. Create a tree that updates only VERSION.
+          TREE_SHA=$(gh api "repos/${{ github.repository }}/git/trees" \
+            --input <(jq -n \
+              --arg base "${{ github.sha }}" \
+              --arg blob "$BLOB_SHA" \
+              '{base_tree: $base, tree: [{
+                path: "VERSION",
+                mode: "100644",
+                type: "blob",
+                sha: $blob
+              }]}') \
+            --jq '.sha')
+
+          # 3. Create the commit.
+          COMMIT_SHA=$(gh api "repos/${{ github.repository }}/git/commits" \
+            -f "message=Release ${TAG}" \
+            -f "tree=${TREE_SHA}" \
+            -f "parents[]=${{ github.sha }}" \
+            --jq '.sha')
+
+          # 4. Fast-forward the branch ref.
+          gh api "repos/${{ github.repository }}/git/refs/heads/${{ github.ref_name }}" \
+            -X PATCH \
+            -f "sha=${COMMIT_SHA}"
+
+          # 5. Create the release tag pointing at the new commit.
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f "ref=refs/tags/${TAG}" \
+            -f "sha=${COMMIT_SHA}"
+
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"             >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Job 2: release
+  #
+  # Checks out the exact tag/commit created by prepare-version, verifies
+  # submodule integrity, pulls the toolchain image by digest (hard fail),
+  # proves reproducibility, packages, signs, and publishes the release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Build, sign, and publish release
+    runs-on: ubuntu-latest
+    needs: prepare-version
+
+    permissions:
+      contents: write
+      id-token: write
+      packages: read
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout the new release tag — full history + submodules
+      #
+      # ref: the exact tag created by prepare-version ensures we build from the
+      # version-bumped commit, not from the dispatch ref (which is 'main').
+      # -----------------------------------------------------------------------
+      - name: Checkout release tag (full history + submodules)
+        # actions/checkout v4.2.2 — SHA-pinned to prevent tag-mutation attacks.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare-version.outputs.tag }}
+          fetch-depth: 0
+          submodules: recursive
+
+      # -----------------------------------------------------------------------
+      # 2. Submodule integrity gate
+      #
+      # Asserts the checked-out submodule HEADs exactly match the gitlinks
+      # recorded in the index (the pinned commits).
+      #
+      #   + prefix → submodule HEAD differs from the pinned index commit
+      #   - prefix → submodule not initialised
+      #   U prefix → merge conflict inside the submodule
+      #
+      # A drift here would mean the cosign-signed SHA256SUMS covers different
+      # source than the pinned commit, breaking the supply-chain proof.
+      # -----------------------------------------------------------------------
+      - name: Submodule integrity gate
+        run: |
+          echo "--- git submodule status --recursive ---"
+          git submodule status --recursive
+          bad=$(git submodule status --recursive | grep -E '^\s*[+\-U]' || true)
+          if [ -n "$bad" ]; then
+            echo "ERROR: submodule(s) out-of-sync with pinned index commits:"
+            echo "$bad"
+            echo ""
+            echo "  '+' = checked-out commit differs from index (stale or rebased upstream)"
+            echo "  '-' = submodule not initialized"
+            echo "  'U' = merge conflict inside submodule"
+            echo ""
+            echo "Fix: git submodule update --init --recursive  (then commit the result)"
+            exit 1
+          fi
+          echo "OK: all submodules match their pinned commits."
+
+      # -----------------------------------------------------------------------
+      # 3. Log in to GitHub Container Registry (to pull the toolchain image)
+      # -----------------------------------------------------------------------
+      - name: Log in to GitHub Container Registry
+        # docker/login-action v3.3.0 — SHA-pinned.
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # 4. Pull toolchain image by digest — HARD FAIL, no fallback
+      #
+      # The digest is sourced from toolchain/IMAGE_DIGEST (a repo-tracked file,
+      # format: sha256:<64-hex>).  Pulling by digest guarantees the release uses
+      # exactly the image that was verified by the B4 reproducibility proof.
+      #
+      # HARD FAIL policy:
+      #   - If IMAGE_DIGEST contains the all-zeros placeholder (sha256:000…0),
+      #     the step exits with a clear operator-facing error: run 'build.py
+      #     image --push' first to build and publish the toolchain image.
+      #   - If the docker pull fails, the job fails — full stop.
+      #   - There is NO continue-on-error and NO inline-build fallback.
+      #
+      # Rationale: a release built with an unverified inline-built image cannot
+      # carry the reproducibility guarantee.  Operators must prepare the image
+      # before triggering a release.
+      # -----------------------------------------------------------------------
+      - name: Pull toolchain image by digest
+        id: pull
+        run: |
+          DIGEST=$(grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1)
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: no valid sha256:<64-hex> line found in toolchain/IMAGE_DIGEST" >&2
+            echo "Run 'python3 tools/build.py image --push' to build and publish the toolchain image." >&2
+            exit 1
+          fi
+          # Reject the all-zeros placeholder (sha256:0000...0).
+          ZERO_DIGEST="sha256:$(printf '0%.0s' {1..64})"
+          if [ "$DIGEST" = "$ZERO_DIGEST" ] || echo "$DIGEST" | grep -qE '^sha256:0{64}$'; then
+            echo "ERROR: toolchain/IMAGE_DIGEST contains the all-zeros placeholder." >&2
+            echo "The toolchain image has not been built and pushed yet." >&2
+            echo "Run 'python3 tools/build.py image --push' to build and publish it," >&2
+            echo "then update toolchain/IMAGE_DIGEST with the real digest." >&2
+            exit 1
+          fi
+          IMAGE_REF="ghcr.io/coreyleavitt/v3ke-toolchain@${DIGEST}"
+          echo "Pulling ${IMAGE_REF} ..."
+          docker pull "${IMAGE_REF}"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # 5. Repro gate — double-build + sha256 comparison
+      #
+      # scripts/repro-check.sh runs the full build twice and asserts byte-identical
+      # sha256 across both runs.  Exits non-zero if any artifact diverges.
+      # This step MUST precede packaging; a non-reproducible build must never be
+      # packaged or published.
+      # -----------------------------------------------------------------------
+      - name: Repro gate (double-build + sha256 compare)
+        run: |
+          IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
+          echo "Running repro-check.sh with image: ${IMAGE_REF}"
+          bash scripts/repro-check.sh --runtime docker --image "${IMAGE_REF}"
+
+      # -----------------------------------------------------------------------
+      # 6. Capture toolchain versions
+      #
+      # ct-build emit-versions prints toolchain component versions as JSON.
+      # Embedded in manifest.json via --toolchain-versions so the provenance
+      # record is complete.
+      # -----------------------------------------------------------------------
+      - name: Capture toolchain versions
+        run: |
+          IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
+          docker run --rm "${IMAGE_REF}" ct-build emit-versions > toolchain-versions.json
+          echo "Toolchain versions:"
+          cat toolchain-versions.json
+
+      # -----------------------------------------------------------------------
+      # 7. Package release zip
+      #
+      # Produces dist/v3ke-<version>-linux-amd64.zip + dist/manifest.json.
+      # --reproducible is justified: the repro gate (step 5) proved byte-identical
+      # output across two independent cold builds.
+      # -----------------------------------------------------------------------
+      - name: Package release zip
+        run: |
+          IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
+          python3 tools/build.py \
+            --runtime docker \
+            --image "${IMAGE_REF}" \
+            release \
+            --reproducible \
+            --toolchain-versions toolchain-versions.json
+
+      # -----------------------------------------------------------------------
+      # 8. SHA256SUMS — compute checksums over all release assets
+      #
+      # Covers the zip AND manifest.json so the cosign signature transitively
+      # authenticates the build provenance record.
+      # -----------------------------------------------------------------------
+      - name: Compute SHA256SUMS
+        run: |
+          cd dist
+          sha256sum v3ke-*-linux-amd64.zip manifest.json > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      # -----------------------------------------------------------------------
+      # 9. Install cosign (keyless signing)
+      # -----------------------------------------------------------------------
+      - name: Install cosign
+        # sigstore/cosign-installer v3.7.0 — SHA-pinned.
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      # -----------------------------------------------------------------------
+      # 10. Sign SHA256SUMS with cosign keyless
+      #
+      # Uses ambient OIDC credentials (id-token: write) via GitHub Actions'
+      # OIDC provider.  Produces SHA256SUMS.sig.
+      #
+      # THIS STEP MUST NOT BE continue-on-error.  Signing failure aborts the
+      # release — releasing unsigned assets is not permitted.
+      # -----------------------------------------------------------------------
+      - name: Sign SHA256SUMS (cosign keyless)
+        run: |
+          cosign sign-blob \
+            --yes \
+            --output-signature dist/SHA256SUMS.sig \
+            dist/SHA256SUMS
+
+      # -----------------------------------------------------------------------
+      # 11. Determine pre-release status
+      #
+      # A version is a prerelease if it contains an -alpha, -beta, or -rc suffix.
+      # This is driven by the dispatch inputs (prerelease != 'no'), not by a
+      # v0.* pattern — the dispatch model makes the intent explicit.
+      # -----------------------------------------------------------------------
+      - name: Determine pre-release status
+        id: prerelease
+        run: |
+          VERSION="${{ needs.prepare-version.outputs.version }}"
+          if echo "${VERSION}" | grep -qE '\-(alpha|beta|rc)\.'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} has a prerelease suffix — marking as pre-release."
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} has no prerelease suffix — marking as full release."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 12. Create GitHub Release and upload assets
+      #
+      # --generate-notes: auto-generates a changelog from merged PRs since the
+      #                   previous tag.
+      # --fail-if-exists: idempotency guard — prevents silently overwriting an
+      #                   existing release if the tag is somehow reused.
+      # --prerelease:     set when the version has an -alpha/-beta/-rc suffix.
+      # Assets: zip, SHA256SUMS, SHA256SUMS.sig, manifest.json.
+      # -----------------------------------------------------------------------
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.prepare-version.outputs.tag }}"
+          PRERELEASE_FLAG=""
+          if [ "${{ steps.prerelease.outputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "${TAG}" \
+            --generate-notes \
+            --fail-if-exists \
+            ${PRERELEASE_FLAG} \
+            dist/v3ke-*-linux-amd64.zip \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sig \
+            dist/manifest.json

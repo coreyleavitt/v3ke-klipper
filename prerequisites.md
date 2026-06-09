@@ -21,11 +21,16 @@ podman + python3 on the build host (the rest is in the image):
     $ ./tools/build.py image       # ~20-40 min first time: bakes the toolchain into the image
     $ ./tools/build.py snapshot    # optional: back the toolchain up to a named volume (dev safety net)
     $ ./tools/build.py artifacts   # build all device artifacts using the image + verify ABI
-    # ...or ./tools/build.py all    (image + artifacts)
 
 The toolchain is baked into the image (self-contained / distributable); build-time cache mounts
 make rebuilds cheap, and the snapshot volume preserves a known-good toolchain across image
 rebuilds while iterating. See toolchain/Containerfile for the full ABI rationale.
+
+## Publishing the toolchain image to ghcr (CI bootstrap)
+
+CI pulls the toolchain image strictly by the digest in `toolchain/IMAGE_DIGEST` — it does not
+build the image itself. The operator builds and publishes the image locally, then commits the
+updated digest file so CI can pull it. See `docs/toolchain-image.md` for the full procedure.
 
 # root printer with helper script
 

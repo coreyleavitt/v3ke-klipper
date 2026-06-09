@@ -2,12 +2,14 @@
 
 Public interface (pure — heavily unit-tested):
   ReleaseError
-      Exception raised by resolve_version when no valid tag is available.
+      Exception raised by resolve_version when the VERSION file is missing,
+      empty, or malformed.
 
-  resolve_version(repo_root, *, runner=subprocess_runner_text) -> str
-      Runs `git -C <repo> describe --match 'v*' --abbrev=12`.
-      Returns stripped output.  Raises ReleaseError on empty/non-v*/error —
-      never returns "unknown".  The error message names the bootstrap step.
+  resolve_version(repo_root) -> str
+      Reads ``<repo_root>/VERSION``, strips whitespace, validates bare semver.
+      Raises ReleaseError on missing file, empty content, or malformed content.
+      The error message names the CI prepare-version job and the local manual
+      workaround.
 
   submodule_provenance(repo_root) -> dict[str, dict]
       Returns {name: {"url": ..., "commit": ...}} for the three pinned submodules
@@ -57,6 +59,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import zipfile
 from datetime import datetime, timezone
@@ -97,7 +100,7 @@ class ReleaseError(RuntimeError):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Default runner (text mode, for git describe)
+# Subprocess runner (used by submodule_provenance and other git-calling helpers)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _subprocess_runner_text(cmd: list[str]) -> str:
@@ -110,59 +113,61 @@ def _subprocess_runner_text(cmd: list[str]) -> str:
 # 1. resolve_version
 # ──────────────────────────────────────────────────────────────────────────────
 
-_BOOTSTRAP_HINT = (
-    "No valid version tag found. "
-    "Bootstrap with: git tag -a v0.1.0 -m 'v0.1.0' && git push origin v0.1.0"
+# Bare semver: X.Y.Z or X.Y.Z-<prerelease> (no leading 'v').
+_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
+
+_VERSION_FILE_HINT = (
+    "The VERSION file is managed by the release workflow's prepare-version CI job. "
+    "For a local build, set it manually: echo '0.1.0' > VERSION"
 )
 
 
-def resolve_version(
-    repo_root: Path,
-    *,
-    runner: Callable[[list[str]], str] = _subprocess_runner_text,
-) -> str:
-    """Return the version string from `git describe --match 'v*'`.
+def resolve_version(repo_root: Path) -> str:
+    """Return the bare semver string from ``<repo_root>/VERSION``.
 
     Parameters
     ----------
     repo_root:
         Absolute path to the git repository root.
-    runner:
-        Callable that accepts a command list and returns stdout as str.
-        Defaults to a real subprocess call.  Injectable for unit tests.
 
     Returns
     -------
     str
-        The stripped `git describe` output, e.g. ``"v0.1.0"`` or
-        ``"v0.1.0-3-gabcdef012345"``.
+        Stripped content of the VERSION file, e.g. ``"0.1.0"`` or
+        ``"0.1.0-rc.1"``.  No ``v`` prefix — the file is bare semver.
 
     Raises
     ------
     ReleaseError
-        If git describe returns empty output, output that does not start with
-        ``v``, or if the runner raises any exception.  The error message
-        always names the one-time bootstrap step (``git tag -a v0.1.0 ...``).
+        If the VERSION file is missing, empty/whitespace-only, or does not
+        match ``^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.]+)?$``.  The error message
+        explains the prepare-version CI job and the local workaround.
     """
-    cmd = ["git", "-C", str(repo_root), "describe", "--match", "v*", "--abbrev=12"]
-    try:
-        raw = runner(cmd)
-    except Exception as exc:
-        raise ReleaseError(
-            f"{_BOOTSTRAP_HINT}\n(underlying error: {exc})"
-        ) from exc
+    version_path = Path(repo_root) / "VERSION"
 
+    if not version_path.exists():
+        raise ReleaseError(
+            f"VERSION file not found at {version_path}. "
+            f"{_VERSION_FILE_HINT}"
+        )
+
+    raw = version_path.read_text(encoding="utf-8")
     stripped = raw.strip()
+
     if not stripped:
         raise ReleaseError(
-            f"{_BOOTSTRAP_HINT}\n(git describe returned empty output)"
+            f"VERSION file at {version_path} is empty or whitespace-only. "
+            f"{_VERSION_FILE_HINT}"
         )
-    if not stripped.startswith("v"):
+
+    if not _VERSION_RE.match(stripped):
         raise ReleaseError(
-            f"{_BOOTSTRAP_HINT}\n"
-            f"(git describe output '{stripped}' does not match v* — "
-            "no annotated tag with 'v' prefix found)"
+            f"VERSION file at {version_path} contains malformed version {stripped!r}. "
+            f"Expected bare semver matching '^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.]+)?$' "
+            f"(no 'v' prefix). "
+            f"{_VERSION_FILE_HINT}"
         )
+
     return stripped
 
 

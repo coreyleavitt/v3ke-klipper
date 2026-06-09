@@ -1,5 +1,5 @@
 """
-ci.yml specifics — hermetic, offline.
+ci.yaml specifics — hermetic, offline.
 
 Merges the behavioral assertions from test_workflows_b2.py (test job),
 test_workflows_b3.py (build job), and test_workflows_b4.py (repro + repro-compare jobs).
@@ -17,14 +17,19 @@ Coverage:
   build job:
     - Gated: if: workflow_dispatch || ref==main (NOT every PR — 61 GB image).
     - Permissions: packages:read + contents:read.
-    - Digest-pinned pull from toolchain/IMAGE_DIGEST + inline fallback.
+    - Submodule integrity gate present (same gate as test job).
+    - Digest-pinned pull from toolchain/IMAGE_DIGEST.
+    - Rejects all-zeros placeholder (sha256:000…0) with operator-facing error.
+    - NO continue-on-error and NO inline toolchain/Containerfile fallback build.
     - Orchestrator invoked: build.py artifacts with --runtime docker.
     - Artifact upload via SHA-pinned actions/upload-artifact.
   repro job:
     - strategy.matrix with ≥2 values (two independent runners).
     - Both instances pull same digest from toolchain/IMAGE_DIGEST.
+    - Submodule integrity gate present (same gate as test job).
     - Gated off PRs.
     - Permissions: packages:read + contents:read.
+    - NO continue-on-error and NO inline toolchain/Containerfile fallback build.
   repro-compare job:
     - needs: repro; sha256 comparison present; diffoscope referenced.
   toolchain/IMAGE_DIGEST:
@@ -52,7 +57,7 @@ from _workflow_helpers import (
 )
 
 REPO_ROOT = repo_root()
-WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 IMAGE_DIGEST_PATH = REPO_ROOT / "toolchain" / "IMAGE_DIGEST"
 GHCR_REPO = "ghcr.io/coreyleavitt/v3ke-toolchain"
 
@@ -66,7 +71,7 @@ def wf() -> dict:
 @pytest.fixture(scope="module")
 def test_job(wf: dict) -> dict:
     jobs = wf.get("jobs", {})
-    assert "test" in jobs, f"No 'test' job in ci.yml; jobs: {list(jobs)}"
+    assert "test" in jobs, f"No 'test' job in ci.yaml; jobs: {list(jobs)}"
     return jobs["test"]
 
 
@@ -78,7 +83,7 @@ def test_steps(test_job: dict) -> list[dict]:
 @pytest.fixture(scope="module")
 def build_job(wf: dict) -> dict:
     jobs = wf.get("jobs", {})
-    assert "build" in jobs, f"No 'build' job in ci.yml; jobs: {list(jobs)}"
+    assert "build" in jobs, f"No 'build' job in ci.yaml; jobs: {list(jobs)}"
     return jobs["build"]
 
 
@@ -91,7 +96,7 @@ def build_steps(build_job: dict) -> list[dict]:
 def repro_job(wf: dict) -> dict:
     jobs = wf.get("jobs", {})
     assert "repro" in jobs, (
-        f"No 'repro' job in ci.yml; jobs: {list(jobs)}\n"
+        f"No 'repro' job in ci.yaml; jobs: {list(jobs)}\n"
         "B4 requires a 'repro' job for the reproducibility proof."
     )
     return jobs["repro"]
@@ -130,21 +135,21 @@ def test_trigger_push_main(wf: dict):
     """CI must run on push to main."""
     push = get_triggers(wf).get("push", {}) or {}
     assert "main" in push.get("branches", []), (
-        "ci.yml push trigger must target 'main'"
+        "ci.yaml push trigger must target 'main'"
     )
 
 
 def test_trigger_pull_request(wf: dict):
     """CI must run on every pull_request (surface failures before merge)."""
     assert "pull_request" in get_triggers(wf), (
-        "ci.yml must have a pull_request trigger"
+        "ci.yaml must have a pull_request trigger"
     )
 
 
 def test_trigger_workflow_dispatch(wf: dict):
     """workflow_dispatch is required for manual re-runs."""
     assert "workflow_dispatch" in get_triggers(wf), (
-        "ci.yml must have a workflow_dispatch trigger"
+        "ci.yaml must have a workflow_dispatch trigger"
     )
 
 
@@ -154,15 +159,21 @@ def test_trigger_workflow_dispatch(wf: dict):
 
 
 def test_test_job_present(wf: dict):
-    assert "test" in wf.get("jobs", {}), "ci.yml must have a 'test' job"
+    assert "test" in wf.get("jobs", {}), "ci.yaml must have a 'test' job"
 
 
 def test_build_job_present(wf: dict):
-    assert "build" in wf.get("jobs", {}), "ci.yml must have a 'build' job"
+    assert "build" in wf.get("jobs", {}), "ci.yaml must have a 'build' job"
 
 
 def test_repro_job_present(wf: dict):
-    assert "repro" in wf.get("jobs", {}), "ci.yml must have a 'repro' job"
+    assert "repro" in wf.get("jobs", {}), "ci.yaml must have a 'repro' job"
+
+
+def test_repro_compare_job_present(wf: dict):
+    assert "repro-compare" in wf.get("jobs", {}), (
+        "ci.yaml must have a 'repro-compare' job"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +340,29 @@ def test_build_job_permissions(build_job: dict):
 
 
 # ---------------------------------------------------------------------------
-# build job — digest-pinned pull + fallback + IMAGE_DIGEST file
+# build job — submodule integrity gate (NEW: must be in build job too)
+# ---------------------------------------------------------------------------
+
+
+def test_build_job_submodule_integrity_gate_present(build_steps: list[dict]):
+    """
+    The build job must have the submodule-integrity gate, identical to the test job.
+    Without it a force-pushed upstream submodule tag could silently swap pinned source
+    for an expensive 61 GB build that passes without detecting the drift.
+    """
+    found = any(
+        "git submodule status" in str(s.get("run", ""))
+        and "+" in str(s.get("run", ""))
+        for s in build_steps
+    )
+    assert found, (
+        "build job must have a submodule-integrity gate step that runs "
+        "'git submodule status --recursive' and checks for the '+' prefix"
+    )
+
+
+# ---------------------------------------------------------------------------
+# build job — digest-pinned pull + IMAGE_DIGEST file
 # ---------------------------------------------------------------------------
 
 
@@ -365,21 +398,56 @@ def test_build_job_references_image_digest(build_steps: list[dict]):
     )
 
 
-def test_build_job_inline_fallback(build_steps: list[dict]):
+def test_build_job_rejects_all_zeros_placeholder(build_steps: list[dict]):
     """
-    An inline fallback step must build the toolchain image from toolchain/Containerfile
-    when the digest pull fails (ghcr unavailable, placeholder digest).
-    This makes the build job self-healing.
+    The build job must explicitly reject the all-zeros placeholder digest with an
+    operator-facing error pointing at 'build.py image --push'.
+    An all-zeros digest would cause 'docker pull' to fail with a cryptic error rather
+    than a clear 'you need to run build.py image --push first' message.
     """
     found = any(
-        "docker build" in str(s.get("run", ""))
-        and "Containerfile" in str(s.get("run", ""))
-        and "toolchain" in str(s.get("run", ""))
+        # Guard text must be present somewhere in the pull step
+        ("0000" in str(s.get("run", "")) or "0{64}" in str(s.get("run", "")))
+        and "IMAGE_DIGEST" in str(s.get("run", ""))
         for s in build_steps
     )
     assert found, (
-        "build job must have an inline fallback 'docker build ... toolchain/Containerfile' step"
+        "build job must explicitly guard against the all-zeros placeholder digest "
+        "(grep for '0000' or '0{64}' pattern) with a clear operator-facing error"
     )
+
+
+def test_build_job_no_continue_on_error(build_steps: list[dict]):
+    """
+    The build job must NOT have continue-on-error: true on any step.
+    The hard-fail digest pull is the contract: if the pull fails, the job fails.
+    continue-on-error silently swallows failures and enables the unsafe fallback path.
+    """
+    for step in build_steps:
+        coe = step.get("continue-on-error")
+        assert coe is not True, (
+            f"build job step {step.get('name', '(unnamed)')!r} must not have "
+            f"continue-on-error: true — the digest pull is a hard fail.\n"
+            "Remove continue-on-error and the inline-build fallback step."
+        )
+
+
+def test_build_job_no_inline_containerfile_fallback(build_steps: list[dict]):
+    """
+    The build job must NOT contain an inline 'docker build ... toolchain/Containerfile'
+    fallback step.  The old self-healing fallback is replaced by a hard-fail pull:
+    if IMAGE_DIGEST is not set (or ghcr is down), the job must fail loudly.
+    An inline fallback builds an unverified image and silently bypasses the
+    reproducibility guarantee.
+    """
+    for step in build_steps:
+        run = str(step.get("run", ""))
+        if "docker build" in run and "Containerfile" in run and "toolchain" in run:
+            pytest.fail(
+                f"build job step {step.get('name', '(unnamed)')!r} contains an "
+                "inline 'docker build ... toolchain/Containerfile' fallback.\n"
+                "This fallback must be removed — the build job uses hard-fail digest pull only."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +502,15 @@ def test_repro_job_matrix_strategy(repro_job: dict):
     )
 
 
+def test_repro_job_fail_fast_false(repro_job: dict):
+    """repro job must set fail-fast: false so both matrix instances always complete."""
+    strategy = repro_job.get("strategy", {})
+    assert strategy.get("fail-fast") is False, (
+        "repro job must set fail-fast: false so the compare step can still run "
+        "even when one matrix instance fails"
+    )
+
+
 # ---------------------------------------------------------------------------
 # repro job — permissions + gating
 # ---------------------------------------------------------------------------
@@ -471,6 +548,62 @@ def test_repro_job_references_image_digest(repro_steps: list[dict]):
     assert steps_contain(repro_steps, "IMAGE_DIGEST"), (
         "repro job must reference IMAGE_DIGEST so both matrix instances pull the same digest"
     )
+
+
+# ---------------------------------------------------------------------------
+# repro job — submodule integrity gate (NEW: must be in repro job too)
+# ---------------------------------------------------------------------------
+
+
+def test_repro_job_submodule_integrity_gate_present(repro_steps: list[dict]):
+    """
+    The repro job must have the submodule-integrity gate, identical to the test job.
+    Both matrix instances independently check out and build; both must verify the
+    submodule pins before the expensive 61 GB build starts.
+    """
+    found = any(
+        "git submodule status" in str(s.get("run", ""))
+        and "+" in str(s.get("run", ""))
+        for s in repro_steps
+    )
+    assert found, (
+        "repro job must have a submodule-integrity gate step that runs "
+        "'git submodule status --recursive' and checks for the '+' prefix"
+    )
+
+
+# ---------------------------------------------------------------------------
+# repro job — no fallback / no continue-on-error (hardening: same as build job)
+# ---------------------------------------------------------------------------
+
+
+def test_repro_job_no_continue_on_error(repro_steps: list[dict]):
+    """
+    The repro job must NOT have continue-on-error: true on any step.
+    The digest pull is a hard fail — if it fails, reproducibility cannot be proven.
+    """
+    for step in repro_steps:
+        coe = step.get("continue-on-error")
+        assert coe is not True, (
+            f"repro job step {step.get('name', '(unnamed)')!r} must not have "
+            f"continue-on-error: true — the digest pull is a hard fail."
+        )
+
+
+def test_repro_job_no_inline_containerfile_fallback(repro_steps: list[dict]):
+    """
+    The repro job must NOT contain an inline 'docker build ... toolchain/Containerfile'
+    fallback step.  The reproducibility proof requires pulling the same pinned image
+    on both runners — an inline build would be unverified and untracked.
+    """
+    for step in repro_steps:
+        run = str(step.get("run", ""))
+        if "docker build" in run and "Containerfile" in run and "toolchain" in run:
+            pytest.fail(
+                f"repro job step {step.get('name', '(unnamed)')!r} contains an "
+                "inline 'docker build ... toolchain/Containerfile' fallback.\n"
+                "This fallback must be removed — the repro job uses hard-fail digest pull only."
+            )
 
 
 # ---------------------------------------------------------------------------
