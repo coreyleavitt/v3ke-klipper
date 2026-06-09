@@ -405,31 +405,133 @@ class TestHostSteps:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# A4-6: host_steps + FakeRunner → run_steps completes without error
+# A4-6: host_steps + materializing runner → run_steps completes without error
 # ──────────────────────────────────────────────────────────────────────────────
 
-class TestHostStepsFakeRunner:
-    """run_steps with FakeRunner must complete all 4 steps without raising.
+# Fixture directory — minimal ELF bytes for ABI verification.
+_FIXTURE_DIR = pathlib.Path(__file__).resolve().parent.parent / "abi" / "fixtures"
 
-    No real files exist so check_abi is not invoked on non-existent output.
-    Confirms the wiring shape without any real build.
+# Minimal chelper __init__.py stub: one .c source, satisfying chelper_sources().
+_CHELPER_INIT_STUB = '''\
+SOURCE_FILES = ["foo.c"]
+'''
+
+
+def _make_hermetic_repo(tmp_path: Path) -> Path:
+    """Populate *tmp_path* with the minimal tree that host_steps() requires.
+
+    host_steps() → c_helper_steps() reads
+    ``<repo_root>/external/klipper/klippy/chelper/__init__.py`` via
+    chelper_sources().  We provide a minimal stub so the step builder succeeds
+    without touching the real submodule tree.  klipper_mcu_steps() only
+    constructs paths (no I/O at step-build time), so no further stubs are needed.
+    """
+    chelper_dir = tmp_path / "external" / "klipper" / "klippy" / "chelper"
+    chelper_dir.mkdir(parents=True)
+    (chelper_dir / "__init__.py").write_text(_CHELPER_INIT_STUB, encoding="utf-8")
+    return tmp_path
+
+
+def _fixture_bytes(kind: "ArtifactKind") -> bytes:
+    """Return golden ELF fixture bytes for the given ArtifactKind.
+
+    Mapping (kind → fixture → ELF type):
+      SHARED_LIBRARY → good_dyn.elf  (ET_DYN, no PT_INTERP)
+      EXECUTABLE     → good_exec.elf (ET_EXEC, with PT_INTERP = ld-linux-mipsn8.so.1)
+    Both pass check_abi() with zero violations.
+    """
+    from abi.abi_spec import ArtifactKind as _Kind
+    if kind is _Kind.SHARED_LIBRARY:
+        return (_FIXTURE_DIR / "good_dyn.elf").read_bytes()
+    if kind is _Kind.EXECUTABLE:
+        return (_FIXTURE_DIR / "good_exec.elf").read_bytes()
+    raise ValueError(f"No fixture defined for kind={kind!r}")  # pragma: no cover
+
+
+class _MaterializingRunner:
+    """Test runner that materialises each step's declared output_path before returning.
+
+    For each step:
+      - Returns RunResult(returncode=0, …) — just like FakeRunner.
+      - If step.output_path is not None *and* kind is ELF-bearing
+        (SHARED_LIBRARY or EXECUTABLE): writes the matching golden fixture so
+        run_steps' post-step ABI verification passes.
+      - If kind is RAW_FIRMWARE and output_path is not None: touches the file
+        (existence check only, no ELF parse).
+      - If output_path is None (clean/olddefconfig steps): creates nothing.
+
+    This lets the *real* run_steps verification logic (H1 existence check + ELF
+    parse + check_abi) exercise a genuine success path without any pre-existing
+    build artefacts in the working tree.
     """
 
-    def test_fake_runner_completes_all_steps(self):
-        steps = host_steps(_REPO_ROOT, _EPOCH, toolchain_root=_FAKE_TC)
-        results = run_steps(steps, FakeRunner())
+    def __init__(self, steps: "list") -> None:
+        # Pre-index steps by cmd identity so __call__ can look up the step
+        # corresponding to the command being executed.
+        self._steps = list(steps)
+        self._call_count = 0
+
+    def __call__(self, cmd: "list[str]") -> "RunResult":
+        from build.artifacts import RunResult
+        from abi.abi_spec import ArtifactKind
+
+        step = self._steps[self._call_count]
+        self._call_count += 1
+
+        if step.output_path is not None:
+            step.output_path.parent.mkdir(parents=True, exist_ok=True)
+            if step.kind is ArtifactKind.RAW_FIRMWARE:
+                # Existence check only — any non-empty bytes suffice.
+                step.output_path.write_bytes(b"\x00")
+            else:
+                # SHARED_LIBRARY or EXECUTABLE: write the matching good fixture
+                # so inspect_elf + check_abi succeed with zero violations.
+                step.output_path.write_bytes(_fixture_bytes(step.kind))
+
+        return RunResult(returncode=0, stdout=b"", stderr=b"", elapsed=0.0)
+
+
+class TestHostStepsFakeRunner:
+    """run_steps with a materializing runner must complete all 4 steps hermetically.
+
+    The two tests below are hermetic by construction:
+      - host_steps() is called with a *temporary* repo root (tmp_path), not
+        _REPO_ROOT, so output_paths land under the temp directory.
+      - _MaterializingRunner writes appropriate fixture bytes for every
+        ELF-bearing output_path before run_steps' post-step verification runs.
+      - The tests therefore pass regardless of what exists in the real tree,
+        and would fail if the runner stopped materializing outputs (the
+        hermeticity proof).
+    """
+
+    def test_fake_runner_completes_all_steps(self, tmp_path):
+        repo = _make_hermetic_repo(tmp_path)
+        steps = host_steps(repo, _EPOCH, toolchain_root=_FAKE_TC)
+        results = run_steps(steps, _MaterializingRunner(steps))
         assert len(results) == 4
         assert all(sr.ok for sr in results)
 
-    def test_step_results_ok_for_all_steps(self):
-        """All 4 steps must succeed with FakeRunner (wiring shape check).
+    def test_step_results_ok_for_all_steps(self, tmp_path):
+        """All 4 host steps succeed; ELF-bearing steps produce a passing AbiResult.
 
-        Note: run_steps will attempt check_abi for SHARED_LIBRARY/EXECUTABLE
-        steps when output_path exists on disk.  The c_helper.so output file may
-        exist from a prior build; if so, check_abi runs against it.  That is
-        correct behavior — we only assert all steps succeed and return results.
+        Step breakdown:
+          c-helper-build        SHARED_LIBRARY → good_dyn.elf  → abi.ok True
+          klipper-mcu-clean     EXECUTABLE, output_path=None   → abi None
+          klipper-mcu-olddefconfig EXECUTABLE, output_path=None → abi None
+          klipper-mcu-build     EXECUTABLE → good_exec.elf     → abi.ok True
         """
-        steps = host_steps(_REPO_ROOT, _EPOCH, toolchain_root=_FAKE_TC)
-        results = run_steps(steps, FakeRunner())
+        repo = _make_hermetic_repo(tmp_path)
+        steps = host_steps(repo, _EPOCH, toolchain_root=_FAKE_TC)
+        results = run_steps(steps, _MaterializingRunner(steps))
         for sr in results:
-            assert sr.ok, f"Step '{sr.name}' unexpectedly failed"
+            assert sr.ok, f"Step '{sr.name}' unexpectedly failed: {sr.detail}"
+        # ELF-bearing steps must carry a non-None, passing AbiResult.
+        elf_results = [sr for sr in results if sr.abi is not None]
+        assert len(elf_results) == 2, (
+            f"Expected 2 ELF-bearing step results (c-helper + klipper-mcu-build), "
+            f"got {len(elf_results)}: {[sr.name for sr in elf_results]}"
+        )
+        for sr in elf_results:
+            assert sr.abi.ok, (
+                f"Step '{sr.name}' abi check failed: {sr.abi.violations}"
+            )
