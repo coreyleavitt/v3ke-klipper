@@ -305,6 +305,41 @@ def test_test_job_not_gated(test_job: dict):
 
 
 # ---------------------------------------------------------------------------
+# detect-image — build/repro SKIP (not fail) before the toolchain image exists
+# ---------------------------------------------------------------------------
+
+
+def test_detect_image_job_present(wf: dict):
+    """A detect-image job must expose has_image so build/repro can skip pre-bootstrap."""
+    jobs = wf.get("jobs", {})
+    assert "detect-image" in jobs, "ci.yaml must have a detect-image job"
+    outputs = jobs["detect-image"].get("outputs", {})
+    assert "has_image" in outputs, "detect-image must expose a has_image output"
+
+
+def test_build_gated_on_image_presence(build_job: dict):
+    """build must need detect-image and gate on has_image (skip, not fail, pre-bootstrap)."""
+    needs = build_job.get("needs", [])
+    if isinstance(needs, str):
+        needs = [needs]
+    assert "detect-image" in needs, "build job must need detect-image"
+    assert "has_image" in str(build_job.get("if", "")), (
+        "build job if: must gate on detect-image.outputs.has_image"
+    )
+
+
+def test_repro_gated_on_image_presence(repro_job: dict):
+    """repro must need detect-image and gate on has_image (skip, not fail, pre-bootstrap)."""
+    needs = repro_job.get("needs", [])
+    if isinstance(needs, str):
+        needs = [needs]
+    assert "detect-image" in needs, "repro job must need detect-image"
+    assert "has_image" in str(repro_job.get("if", "")), (
+        "repro job if: must gate on detect-image.outputs.has_image"
+    )
+
+
+# ---------------------------------------------------------------------------
 # build job — gating (NOT on every PR)
 # ---------------------------------------------------------------------------
 

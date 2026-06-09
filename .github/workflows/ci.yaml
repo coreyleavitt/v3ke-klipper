@@ -124,12 +124,49 @@ jobs:
   # toolchain/Containerfile fallback.  Run 'build.py image --push' to publish
   # the toolchain image before triggering this job.
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # detect-image: is a real toolchain image published yet?
+  #
+  # The build/repro jobs can only run once the (huge, locally-built) toolchain
+  # image has been pushed to ghcr and its digest recorded in
+  # toolchain/IMAGE_DIGEST.  Until then the file holds the all-zeros placeholder.
+  # This job reads it and exposes `has_image`, so build/repro SKIP (not fail)
+  # before the one-time bootstrap.  Release (release.yaml) still hard-fails —
+  # you must never publish a release without the verified image.
+  # ---------------------------------------------------------------------------
+  detect-image:
+    name: Detect toolchain image availability
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has_image: ${{ steps.check.outputs.has_image }}
+    steps:
+      - name: Checkout
+        # actions/checkout v4.2.2 — SHA-pinned.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check toolchain/IMAGE_DIGEST
+        id: check
+        run: |
+          DIGEST=$(grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1 || true)
+          if [ -n "$DIGEST" ] && ! echo "$DIGEST" | grep -qE '^sha256:0{64}$'; then
+            echo "has_image=true" >> "$GITHUB_OUTPUT"
+            echo "Toolchain image digest present — build/repro will run."
+          else
+            echo "has_image=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::toolchain/IMAGE_DIGEST is the all-zeros placeholder — skipping build/repro until 'build.py image --push' publishes the toolchain image."
+          fi
+
   build:
     name: Build artifacts + ABI-verify (v3ke-toolchain)
     runs-on: ubuntu-latest
+    needs: detect-image
 
-    # Only on explicit dispatch or push to main — never on every PR.
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    # Skip when no toolchain image is published yet (placeholder digest) — there
+    # is nothing to build or verify. Otherwise gate off PRs (the image is ~61 GB).
+    if: >
+      needs.detect-image.outputs.has_image == 'true' &&
+      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
 
     # Least-privilege: pull from ghcr (packages: read) + checkout (contents: read).
     # No write scopes: this job only consumes the toolchain image, does not push.
@@ -294,12 +331,15 @@ jobs:
   repro:
     name: "Reproducibility build ${{ matrix.run }}/2 (v3ke-toolchain)"
     runs-on: ubuntu-latest
+    needs: detect-image
 
-    # Only on explicit dispatch, push to main, or tag push — never on every PR.
+    # Skip when no toolchain image is published yet (placeholder digest).
+    # Otherwise only on dispatch, push to main, or tag push — never on every PR.
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/tags/')
+      needs.detect-image.outputs.has_image == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/tags/'))
 
     # Least-privilege: pull from ghcr (packages: read) + checkout (contents: read).
     permissions:
