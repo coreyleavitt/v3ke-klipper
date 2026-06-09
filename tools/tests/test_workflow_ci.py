@@ -11,8 +11,8 @@ Coverage:
     - Triggers: push→main, pull_request, workflow_dispatch.
     - Checkout: fetch-depth:0, submodules:recursive.
     - Submodule-integrity gate: greps git submodule status for +/-/U.
-    - Python suite: pytest -m "not integration" inside v3ke-dev (NOT toolchain image).
-    - Nim suite: nim c -r (NOT nimble test) tharness+tabi inside v3ke-dev.
+    - Python suite: pytest -m "not integration" natively via uv (setup-uv; no container).
+    - Nim suite: nim c -r (NOT nimble test) tharness+tabi in the pinned public nim image.
     - test job: no if: gating (runs on every push/PR).
   build job:
     - Gated: if: workflow_dispatch || ref==main (NOT every PR — 61 GB image).
@@ -223,65 +223,71 @@ def test_submodule_integrity_gate_present(test_steps: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# test job — Python suite: pytest -m "not integration" in v3ke-dev
+# test job — Python suite: pytest -m "not integration" natively via uv
 # ---------------------------------------------------------------------------
 
 
-def test_pytest_not_integration_in_v3ke_dev(test_steps: list[dict]):
+def test_setup_uv_present(test_steps: list[dict]):
+    """The Python suite runs natively on the runner — uv is set up via setup-uv."""
+    assert any(
+        "astral-sh/setup-uv" in str(s.get("uses", "")) for s in test_steps
+    ), "test job must set up uv via the astral-sh/setup-uv action"
+
+
+def test_pytest_not_integration_via_uv(test_steps: list[dict]):
     """
-    pytest must run with -m 'not integration' inside the v3ke-dev image.
-    'not integration' excludes toolchain-image-gated tests from the unit CI job.
-    v3ke-dev (not v3ke-toolchain) is the correct image — the unit suite is lightweight.
+    pytest must run with -m 'not integration' via `uv run` (natively on the runner,
+    not in a container). 'not integration' excludes toolchain-image-gated tests.
     """
     found = any(
         "pytest" in str(s.get("run", ""))
         and "not integration" in str(s.get("run", ""))
-        and "v3ke-dev" in str(s.get("run", ""))
+        and "uv run" in str(s.get("run", ""))
         for s in test_steps
     )
     assert found, (
-        "test job must run 'pytest -m \"not integration\"' inside the v3ke-dev image"
+        "test job must run 'uv run ... pytest -m \"not integration\"' natively"
     )
 
 
 def test_pytest_not_in_toolchain_image(test_steps: list[dict]):
-    """pytest must NOT run in v3ke-toolchain (unit suite needs only v3ke-dev)."""
+    """pytest must NOT run in v3ke-toolchain (the unit suite needs no toolchain)."""
     for step in test_steps:
         run = str(step.get("run", ""))
         if "pytest" in run:
             assert "v3ke-toolchain" not in run, (
-                "pytest step must not reference v3ke-toolchain; only v3ke-dev is needed"
+                "pytest step must not reference v3ke-toolchain; it runs natively"
             )
 
 
 # ---------------------------------------------------------------------------
-# test job — Nim suite: nim c -r (NOT nimble test) in v3ke-dev
+# test job — Nim suite: nim c -r (NOT nimble test) in the pinned nim image
 # ---------------------------------------------------------------------------
 
 
 def test_nim_uses_direct_nim_not_nimble(test_steps: list[dict]):
     """
-    'nimble test' downloads stock nim from the network (~16 MB per run), breaking
-    --network=none hermeticity.  The canonical command is 'nim c --hints:off -r'.
+    'nimble test' downloads stock nim from the network (~16 MB per run).  The
+    canonical command is 'nim c --hints:off -r', which needs no network.
     """
     for step in test_steps:
         run = str(step.get("run", ""))
         if "tharness" in run or "tabi" in run:
             assert "nimble test" not in run, (
-                "Nim test step must not use 'nimble test' — it downloads stock nim from "
-                "the network on every run (breaks --network=none hermeticity).\n"
+                "Nim test step must not use 'nimble test' — it downloads stock nim "
+                "from the network on every run.\n"
                 "Use 'nim c --hints:off --path:. -r tests/t*.nim' instead."
             )
 
 
-def test_nim_runs_tharness_and_tabi_in_v3ke_dev(test_steps: list[dict]):
-    """tharness.nim + tabi.nim must both be driven inside v3ke-dev."""
+def test_nim_runs_tharness_and_tabi_in_nim_image(test_steps: list[dict]):
+    """tharness.nim + tabi.nim must both be driven inside the pinned, public nim image."""
     found_tharness = any(
-        "tharness" in str(s.get("run", "")) and "v3ke-dev" in str(s.get("run", ""))
+        "tharness" in str(s.get("run", "")) and "coreyleavitt/nim" in str(s.get("run", ""))
         for s in test_steps
     )
     found_tabi = any("tabi" in str(s.get("run", "")) for s in test_steps)
-    assert found_tharness, "Nim test step must run tharness.nim inside v3ke-dev"
+    assert found_tharness, "Nim step must run tharness.nim inside the pinned nim image"
     assert found_tabi, "Nim test step must also run tabi.nim"
 
 

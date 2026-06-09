@@ -19,7 +19,7 @@ permissions: {}
 
 jobs:
   test:
-    name: Unit tests (Python + Nim) in v3ke-dev
+    name: Unit tests (Python + Nim)
     runs-on: ubuntu-latest
 
     # Least-privilege: only checkout needs contents read; nothing else.
@@ -74,75 +74,37 @@ jobs:
           echo "OK: all submodules match their pinned commits."
 
       # ---------------------------------------------------------------------------
-      # Build the lightweight v3ke-dev image.
+      # Python unit suite — run natively on the runner (no container).
       #
-      # This image (tools/Containerfile: nim 2.2.10 + uv 0.11.19 + act) is
-      # intentionally small (~few hundred MB) — it is NOT the 61 GB cross-toolchain
-      # image.  It provides nim + gcc + uv + python for the unit-test loop only.
-      #
-      # ubuntu-latest ships Docker; the project convention is podman locally, but
-      # GitHub-hosted runners do not have rootless podman by default.  Docker is
-      # used here for CI only; the local dev path stays podman (tools/Containerfile
-      # and the developer UX are identical — both are OCI images).
+      # The Python tests are pure pytest over tools/; they need only python + uv +
+      # the locked deps, nothing from the cross-toolchain. A CI runner is ephemeral,
+      # so the "devtools in containers" workstation convention doesn't apply here —
+      # setup-uv + `uv run` is simpler, faster, and provisions the pyproject's
+      # requires-python automatically. uv is pinned to match tools/Containerfile.
       # ---------------------------------------------------------------------------
-      - name: Build v3ke-dev image
-        # -f tools/Containerfile is required: the dev image uses the podman
-        # `Containerfile` name, which `docker build` does NOT auto-detect (it
-        # only looks for `Dockerfile` by default).
-        run: docker build -f tools/Containerfile -t v3ke-dev tools/
+      - name: Set up uv
+        # astral-sh/setup-uv v8.2.0 — SHA-pinned.
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.11.19"
 
-      # ---------------------------------------------------------------------------
-      # Python unit suite
-      #
-      # Mirrors the canonical local command from §8 of the RFC:
-      #   podman run --rm -v "$PWD":/w:Z -w /w/tools v3ke-dev uv run pytest -m "not integration" -q
-      #
-      # -m "not integration": runs only the unit tests (A1–A5a constraint tests,
-      # B0/B1 workflow lints, etc.) that need only v3ke-dev — never the toolchain image.
-      # Integration tests (@pytest.mark.integration, gated on CROSS_TOOLCHAIN) are
-      # deferred to the B3 build job.
-      # ---------------------------------------------------------------------------
-      # uv resolves/downloads the locked deps into the mounted .venv here, with
-      # the network ON — this is the only step that needs it. --frozen pins to
-      # uv.lock exactly (no lock mutation). The suite itself then runs hermetically.
-      - name: Sync Python deps (uv, network on)
-        run: |
-          docker run --rm \
-            -v "$PWD":/w:Z \
-            -w /w/tools \
-            v3ke-dev \
-            uv sync --frozen
-
-      # Hermetic: --network=none + --no-sync (deps already present from the step
-      # above, so uv must not reach out). A unit test that needs the network is a
-      # bug — it belongs behind @pytest.mark.integration.
       - name: Python unit suite (pytest -m "not integration")
-        run: |
-          docker run --rm \
-            --network=none \
-            -v "$PWD":/w:Z \
-            -w /w/tools \
-            v3ke-dev \
-            uv run --no-sync pytest -m "not integration" -q
+        working-directory: tools
+        run: uv run --frozen pytest -m "not integration" -q
 
       # ---------------------------------------------------------------------------
-      # Nim unit suite
+      # Nim unit suite — run inside the pinned, now-public Nim image (no build).
       #
-      # Canonical command (from the handoff: "nimble test" side-effect-downloads stock
-      # nim; use direct nim c -r instead):
-      #   nim c --hints:off --path:. -r tests/tharness.nim
-      #   nim c --hints:off --path:. -r tests/tabi.nim
-      #
-      # Workdir is /w/tools/v3ke (where v3ke.nimble lives and --path:. resolves).
-      # --network=none: hermetic; the Nim compiler needs no network to compile these.
+      # Pulling ghcr.io/coreyleavitt/nim:2.2.10 gives the exact pinned compiler
+      # with zero build and no login (public). nim c -r needs no network. Workdir
+      # is /w/tools/v3ke (where v3ke.nimble lives and --path:. resolves).
       # ---------------------------------------------------------------------------
       - name: Nim unit suite (tharness + tabi)
         run: |
           docker run --rm \
-            --network=none \
             -v "$PWD":/w:Z \
             -w /w/tools/v3ke \
-            v3ke-dev \
+            ghcr.io/coreyleavitt/nim:2.2.10 \
             sh -c 'nim c --hints:off --path:. -r tests/tharness.nim && nim c --hints:off --path:. -r tests/tabi.nim'
 
   # ---------------------------------------------------------------------------
