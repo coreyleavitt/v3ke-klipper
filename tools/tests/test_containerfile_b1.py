@@ -47,31 +47,81 @@ def _from_lines(text: str) -> list[str]:
     return lines
 
 
+def _arg_defaults(text: str) -> dict[str, str]:
+    """Map of ARG NAME -> default value (global + per-stage), for ${NAME} substitution."""
+    args: dict[str, str] = {}
+    for raw in text.splitlines():
+        m = re.match(r"(?i)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(.+?)\s*$", raw)
+        if m:
+            args[m.group(1)] = m.group(2)
+    return args
+
+
+def _stage_names(text: str) -> set[str]:
+    """Names of internal build stages (FROM ... AS <name>), lower-cased."""
+    names = set()
+    for line in _from_lines(text):
+        m = re.search(r"(?i)\bAS\s+([A-Za-z0-9_.-]+)\s*$", line)
+        if m:
+            names.add(m.group(1).lower())
+    return names
+
+
+def _external_base_refs(text: str) -> list[str]:
+    """Image refs of FROMs that point at an EXTERNAL image, after ${ARG} substitution.
+
+    Multi-stage Containerfiles reference the external base via an ``ARG BASE=...@sha256:``
+    used as ``FROM ${BASE}``, plus internal ``FROM <stage>`` lines that need no pin. This
+    returns only the resolved external refs (the ones a digest pin actually applies to).
+    """
+    args = _arg_defaults(text)
+    stages = _stage_names(text)
+    refs: list[str] = []
+    for line in _from_lines(text):
+        m = re.match(r"(?i)^FROM\s+(\S+)", line)
+        if not m:
+            continue
+        ref = m.group(1)
+        ref = re.sub(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+            lambda mm: args.get(mm.group(1) or mm.group(2), mm.group(0)),
+            ref,
+        )
+        if ref.lower() in stages:
+            continue  # internal stage reference — no external pin required
+        refs.append(ref)
+    return refs
+
+
 def test_has_a_from_directive(containerfile_text: str) -> None:
     assert _from_lines(containerfile_text), "toolchain/Containerfile has no FROM directive"
 
 
+def test_has_an_external_base(containerfile_text: str) -> None:
+    assert _external_base_refs(containerfile_text), (
+        "toolchain/Containerfile references no external base image"
+    )
+
+
 def test_base_image_is_digest_pinned(containerfile_text: str) -> None:
-    """Every FROM pins an immutable @sha256: digest."""
-    froms = _from_lines(containerfile_text)
-    for line in froms:
-        assert "@sha256:" in line, f"FROM is not digest-pinned: {line!r}"
+    """Every EXTERNAL base image (post ${ARG} substitution) pins an immutable @sha256: digest."""
+    for ref in _external_base_refs(containerfile_text):
+        assert "@sha256:" in ref, f"external base is not digest-pinned: {ref!r}"
 
 
 def test_base_image_is_not_a_mutable_latest_tag(containerfile_text: str) -> None:
-    """No FROM uses the mutable :latest tag (the whole point of B1)."""
-    for line in _from_lines(containerfile_text):
-        assert ":latest" not in line, f"FROM still uses a mutable :latest tag: {line!r}"
+    """No external base uses the mutable :latest tag (the whole point of B1)."""
+    for ref in _external_base_refs(containerfile_text):
+        assert ":latest" not in ref, f"external base still uses a mutable :latest tag: {ref!r}"
 
 
 def test_digest_is_a_full_sha256(containerfile_text: str) -> None:
-    """The pinned digest is a well-formed 64-hex sha256 (not a truncated stub)."""
-    froms = _from_lines(containerfile_text)
-    for line in froms:
-        m = re.search(r"@sha256:([0-9a-f]+)", line)
-        assert m, f"FROM has no sha256 digest: {line!r}"
+    """Each external base's pinned digest is a well-formed 64-hex sha256 (not a truncated stub)."""
+    for ref in _external_base_refs(containerfile_text):
+        m = re.search(r"@sha256:([0-9a-f]+)", ref)
+        assert m, f"external base has no sha256 digest: {ref!r}"
         assert len(m.group(1)) == 64, (
-            f"sha256 digest is not 64 hex chars (got {len(m.group(1))}): {line!r}"
+            f"sha256 digest is not 64 hex chars (got {len(m.group(1))}): {ref!r}"
         )
 
 
