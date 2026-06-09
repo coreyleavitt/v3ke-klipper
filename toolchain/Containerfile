@@ -138,6 +138,14 @@ COPY --from=arm-build  /opt/x-tools/arm-none-eabi              /opt/x-tools/arm-
 COPY ct_build.py /usr/local/bin/ct-build
 RUN chmod +x /usr/local/bin/ct-build
 
+# Trust any bind-mounted repo: the build orchestrator runs `git` in /work (e.g.
+# SOURCE_DATE_EPOCH from git log). Under docker the mounted /work is owned by the
+# host runner's uid, not container-root, so git's dubious-ownership guard aborts
+# (exit 128). The image only ever operates on the user's own bind-mounted repo, so
+# trusting all directories is correct here. (Rootless podman remaps uids and didn't
+# trip this — but CI runs docker.)
+RUN git config --system --add safe.directory '*'
+
 ENV CROSS_TOOLCHAIN=/opt/x-tools/mipsel-buildroot-linux-gnu
 ENV PATH=/opt/x-tools/mipsel-buildroot-linux-gnu/bin:/opt/x-tools/arm-none-eabi/bin:$PATH
 WORKDIR /work

@@ -7,4 +7,4 @@
 #   grep -E '^sha256:[0-9a-f]{{64}}$' toolchain/IMAGE_DIGEST | head -1
 #
 # Do not edit manually; run: python3 tools/build.py --image <ref> image --push
-sha256:416c647b48290609bb7b97fd0a18869f8489b1e7410596ca080f2148a8ccaf0f
+sha256:7597f5017279dde4eb03bc45eaab07ec2f48add4df0035366a8d0c6a37cacf7d
