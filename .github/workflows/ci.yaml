@@ -86,7 +86,10 @@ jobs:
       # and the developer UX are identical — both are OCI images).
       # ---------------------------------------------------------------------------
       - name: Build v3ke-dev image
-        run: docker build -t v3ke-dev tools/
+        # -f tools/Containerfile is required: the dev image uses the podman
+        # `Containerfile` name, which `docker build` does NOT auto-detect (it
+        # only looks for `Dockerfile` by default).
+        run: docker build -f tools/Containerfile -t v3ke-dev tools/
 
       # ---------------------------------------------------------------------------
       # Python unit suite
