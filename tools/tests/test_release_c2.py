@@ -596,6 +596,22 @@ class TestWriteReleaseZip:
         zip_path, _ = self._write_zip(tmp_path)
         assert zip_path.name == "v3ke-0.1.0-linux-amd64.zip"
 
+    def test_standalone_manifest_written(self, tmp_path):
+        """A standalone manifest.json is written next to the zip (the release flow
+        checksums + cosign-signs it and publishes it as its own asset)."""
+        zip_path, _ = self._write_zip(tmp_path)
+        assert (zip_path.parent / "manifest.json").exists(), (
+            "write_release_zip must write a standalone manifest.json next to the zip"
+        )
+
+    def test_standalone_manifest_matches_embedded(self, tmp_path):
+        """The standalone manifest.json is byte-identical to the copy inside the zip."""
+        zip_path, _ = self._write_zip(tmp_path)
+        standalone = (zip_path.parent / "manifest.json").read_bytes()
+        with zipfile.ZipFile(zip_path) as zf:
+            embedded = zf.read("manifest.json")
+        assert standalone == embedded
+
     def test_zip_contains_install_md(self, tmp_path):
         zip_path, _ = self._write_zip(tmp_path)
         with zipfile.ZipFile(zip_path) as zf:

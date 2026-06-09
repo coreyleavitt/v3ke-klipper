@@ -546,4 +546,11 @@ def write_release_zip(
         manifest_info = zipfile.ZipInfo("manifest.json", date_time=fixed_mtime)
         zf.writestr(manifest_info, manifest_json)
 
+    # Also write a standalone manifest.json next to the zip. The release flow
+    # checksums (and signs) the zip AND a standalone manifest.json, and publishes
+    # manifest.json as its own release asset — so consumers can read provenance
+    # without unzipping, and the cosign-signed SHA256SUMS covers it. Same bytes
+    # as the copy embedded in the zip.
+    (out_dir / "manifest.json").write_text(manifest_json, encoding="utf-8")
+
     return zip_path
