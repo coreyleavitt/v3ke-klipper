@@ -28,7 +28,7 @@ INSTALLED_GCC = "/opt/x-tools/mipsel-buildroot-linux-gnu/bin/mipsel-buildroot-li
 
 # Pure helpers + updated cmd_image live in build_main so they are unit-testable
 # without importing this CLI entry-point.
-from build_main import cmd_image, parse_repo_digest, write_image_digest  # noqa: E402
+from build_main import cmd_image, write_image_digest  # noqa: E402
 
 
 def run(cmd):
@@ -176,9 +176,9 @@ def main():
     pi.add_argument(
         "--push", action="store_true", default=False,
         help=(
-            "after building, push the image to the registry, capture the registry "
-            "digest via 'inspect --format {{index .RepoDigests 0}}', and write it "
-            "to toolchain/IMAGE_DIGEST (for digest-pinned CI pulls)"
+            "after building, push the image to the registry, capture the manifest "
+            "digest from the push output (podman: --digestfile; docker: stdout), "
+            "and write it to toolchain/IMAGE_DIGEST (for digest-pinned CI pulls)"
         ),
     )
 

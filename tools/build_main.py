@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-import sys
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -23,48 +23,56 @@ _DIGEST_RE = re.compile(r"sha256:([0-9a-f]{64})(?!\w)")
 _BARE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # ---------------------------------------------------------------------------
-# Helper: parse_repo_digest
+# Helper: extract_pushed_digest
 # ---------------------------------------------------------------------------
 
 
-def parse_repo_digest(inspect_output: str) -> str:
-    """Extract a bare ``sha256:<64-hex>`` token from container inspect output.
+def extract_pushed_digest(
+    push_stdout: str,
+    digestfile_text: str | None = None,
+) -> str:
+    """Return the bare ``sha256:<64-hex>`` digest captured from a push operation.
 
-    Both runtimes emit the pushed image's RepoDigest as a line like:
+    Two sources are tried in priority order:
 
-        ghcr.io/coreyleavitt/v3ke-toolchain@sha256:<64hex>
+    1. **digestfile_text** (podman path) — podman writes the exact registry
+       digest to a file via ``--digestfile <path>``.  Pass the file's contents
+       here.  If non-empty after stripping, it is validated and returned
+       directly without consulting *push_stdout*.
 
-    Podman may wrap it in list brackets (``[...]``) or quotes; Docker usually
-    does not.  This function is tolerant of leading/trailing whitespace and
-    bracket/quote wrapping, but strict about the digest format itself.
+    2. **push_stdout** (docker path) — docker prints a line of the form
+       ``<tag>: digest: sha256:<64hex> size: <n>`` on stdout.  Any
+       ``sha256:<64hex>`` token found in the output is accepted.
 
     Args:
-        inspect_output: Raw stdout from ``<runtime> inspect --format
-            '{{index .RepoDigests 0}}' <image>``.
+        push_stdout: Captured stdout from the push command.
+        digestfile_text: Contents of the ``--digestfile`` output file, or
+            ``None`` / empty string if no digestfile was used.
 
     Returns:
-        The bare ``sha256:<64-hex>`` token, e.g.
-        ``sha256:abc123...`` (70 chars total).
+        Bare ``sha256:<64-hex>`` token, e.g. ``sha256:abc123...`` (70 chars).
 
     Raises:
-        ValueError: If no valid ``sha256:<64-hex>`` token is found in the
-            input, or if the hex portion is not exactly 64 lowercase characters.
+        ValueError: If the chosen source does not yield a valid
+            ``sha256:[0-9a-f]{64}`` token.
     """
-    text = inspect_output.strip()
+    # --- Digestfile path (podman) ---
+    if digestfile_text:
+        candidate = digestfile_text.strip()
+        if not _BARE_DIGEST_RE.match(candidate):
+            raise ValueError(
+                f"Invalid digest in digestfile: {candidate!r}. "
+                "Expected exactly 'sha256:<64 lowercase hex chars>'."
+            )
+        return candidate
 
-    # Fast path: bare digest with nothing else
-    if _BARE_DIGEST_RE.match(text):
-        return text
-
-    # Find all sha256: occurrences followed by exactly 64 lowercase hex chars
-    # that are NOT followed by more word characters (would indicate wrong length).
-    match = _DIGEST_RE.search(text)
+    # --- Stdout path (docker, or podman fallback) ---
+    match = _DIGEST_RE.search(push_stdout)
     if match is None:
         raise ValueError(
-            f"No valid sha256:<64-hex> digest found in inspect output: {inspect_output!r}. "
-            "Expected output like 'ghcr.io/image@sha256:<64 lowercase hex chars>'."
+            f"No valid sha256:<64-hex> digest found in push stdout: {push_stdout!r}. "
+            "Expected output containing 'sha256:<64 lowercase hex chars>'."
         )
-
     return "sha256:" + match.group(1)
 
 
@@ -79,7 +87,7 @@ _COMMENT_HEADER = """\
 # toolchain image.  CI pulls the image strictly by this digest (no inline-
 # build fallback).  The grep pattern used by CI is:
 #
-#   grep -E '^sha256:[0-9a-f]{{64}}$' toolchain/IMAGE_DIGEST | head -1
+#   grep -E '^sha256:[0-9a-f]{64}$' toolchain/IMAGE_DIGEST | head -1
 #
 # Do not edit manually; run: python3 tools/build.py --image <ref> image --push
 """
@@ -116,14 +124,8 @@ def write_image_digest(path: Path, digest: str) -> None:
 Runner = Callable[[list[str]], str | None]
 
 
-def _default_runner(cmd: list[str]) -> None:
-    """Real runner: prints + executes, returns None."""
-    print("+ " + " ".join(map(str, cmd)), flush=True)
-    subprocess.run(cmd, check=True)
-
-
 def _capturing_runner(cmd: list[str]) -> str:
-    """Runner used for inspect: captures and returns stdout."""
+    """Real runner: prints, executes, captures and returns stdout."""
     print("+ " + " ".join(map(str, cmd)), flush=True)
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return result.stdout.strip()
@@ -149,8 +151,9 @@ def cmd_image(
             - ``a.image``    – image tag/ref (e.g. ``ghcr.io/org/repo:v0.1.0``)
             - ``a.ctng_version`` – optional build-arg override
             - ``a.push``     – bool; when True, push after build, capture
-              the registry digest via ``inspect``, and write it to
-              *digest_path* (or the default ``toolchain/IMAGE_DIGEST``).
+              the registry digest from the push output (podman: via
+              ``--digestfile``; docker: from push stdout), and write it
+              to *digest_path* (or the default ``toolchain/IMAGE_DIGEST``).
 
         runner: Callable ``(cmd: list[str]) -> str | None``.  Defaults to the
             real subprocess runner.  Inject a fake for unit tests.
@@ -162,11 +165,9 @@ def cmd_image(
     image: str = a.image
 
     if runner is None:
-        _run = _default_runner
-        _inspect_run = _capturing_runner
+        _run = _capturing_runner
     else:
         _run = runner
-        _inspect_run = runner
 
     # 1. Build
     build_cmd = [runtime, "build", "-t", image, "-f", str(TOOLCHAIN / "Containerfile")]
@@ -178,21 +179,38 @@ def cmd_image(
     if not push:
         return
 
-    # 2. Push
-    push_cmd = [runtime, "push", image]
-    _run(push_cmd)
+    # 2. Push — capture the registry digest from the push itself.
+    #
+    #   podman: ``--digestfile <path>`` writes the exact manifest digest that
+    #           the registry accepted.  We read it back after the push.
+    #   docker: ``docker push`` prints "digest: sha256:<64hex> size: …" on
+    #           stdout; we parse that instead (docker has no --digestfile).
+    #
+    # In both cases the digest comes from the push operation itself, NOT from
+    # a post-push ``inspect`` call.  inspect returns a locally-cached
+    # RepoDigests value that may differ from what the registry actually served.
 
-    # 3. Inspect — capture RepoDigests[0] post-push
-    inspect_cmd = [
-        runtime, "inspect",
-        "--format", "{{index .RepoDigests 0}}",
-        image,
-    ]
-    raw = _inspect_run(inspect_cmd)
+    digestfile_text: str | None = None
 
-    digest = parse_repo_digest(raw or "")
+    if runtime == "podman":
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".digest", delete=False
+        ) as _tf:
+            digestfile_path = _tf.name
+        push_cmd = [runtime, "push", "--digestfile", digestfile_path, image]
+        push_stdout = _run(push_cmd) or ""
+        try:
+            digestfile_text = Path(digestfile_path).read_text(encoding="utf-8")
+        except OSError:
+            digestfile_text = ""
+    else:
+        # docker (and any unrecognised runtime): rely on stdout
+        push_cmd = [runtime, "push", image]
+        push_stdout = _run(push_cmd) or ""
 
-    # 4. Write IMAGE_DIGEST
+    digest = extract_pushed_digest(push_stdout, digestfile_text=digestfile_text)
+
+    # 3. Write IMAGE_DIGEST
     if digest_path is None:
         digest_path = _DIGEST_FILE
     write_image_digest(digest_path, digest)
