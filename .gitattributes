@@ -39,3 +39,9 @@
 *.xcf filter=lfs diff=lfs merge=lfs -text
 *.bin filter=lfs diff=lfs merge=lfs -text
 *.elf filter=lfs diff=lfs merge=lfs -text
+
+# Golden ELF test fixtures (tools/abi/fixtures) are tiny (~300 B) version-controlled
+# test data, NOT firmware artifacts — keep them as regular git blobs so any checkout
+# (CI without `lfs: true`, a fresh clone) gets the real bytes. The general *.elf LFS
+# rule above is for large firmware ELFs, which are gitignored and never committed.
+tools/abi/fixtures/*.elf !filter !diff !merge -text
