@@ -102,6 +102,20 @@ jobs:
       # Integration tests (@pytest.mark.integration, gated on CROSS_TOOLCHAIN) are
       # deferred to the B3 build job.
       # ---------------------------------------------------------------------------
+      # uv resolves/downloads the locked deps into the mounted .venv here, with
+      # the network ON — this is the only step that needs it. --frozen pins to
+      # uv.lock exactly (no lock mutation). The suite itself then runs hermetically.
+      - name: Sync Python deps (uv, network on)
+        run: |
+          docker run --rm \
+            -v "$PWD":/w:Z \
+            -w /w/tools \
+            v3ke-dev \
+            uv sync --frozen
+
+      # Hermetic: --network=none + --no-sync (deps already present from the step
+      # above, so uv must not reach out). A unit test that needs the network is a
+      # bug — it belongs behind @pytest.mark.integration.
       - name: Python unit suite (pytest -m "not integration")
         run: |
           docker run --rm \
@@ -109,7 +123,7 @@ jobs:
             -v "$PWD":/w:Z \
             -w /w/tools \
             v3ke-dev \
-            uv run pytest -m "not integration" -q
+            uv run --no-sync pytest -m "not integration" -q
 
       # ---------------------------------------------------------------------------
       # Nim unit suite
