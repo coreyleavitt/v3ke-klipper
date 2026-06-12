@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import tarfile
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -51,6 +52,7 @@ def _make_fake_repo(tmp_path: Path) -> Path:
     (repo / "external" / "klipper" / "klippy" / "chelper" / "c_helper.so").write_bytes(b"so")
     (repo / "tools" / "v3ke").mkdir(parents=True)
     (repo / "tools" / "v3ke" / "v3ke").write_bytes(b"nim binary")
+    (repo / "tools" / "v3ke" / "v3ke.exe").write_bytes(b"nim binary windows")
     (repo / "LICENSE").write_text("repo license")
     (repo / "external" / "katapult" / "LICENSE").write_text("katapult license")
     (repo / "external" / "klipper" / "COPYING").write_text("klipper license")
@@ -548,13 +550,13 @@ class TestR2L1ManifestIntegrity:
     """
 
     def test_manifest_sha256_matches_packed_bytes(self, tmp_path):
-        """For every artifact in the manifest, sha256 must equal sha256(zip_bytes)."""
-        zip_path, repo = _write_zip(tmp_path)
-        with zipfile.ZipFile(zip_path) as zf:
-            manifest = json.loads(zf.read("manifest.json"))
+        """For every artifact in the manifest, sha256 must equal sha256(bundle_bytes)."""
+        bundle_path, repo = _write_zip(tmp_path)
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
             for entry in manifest["artifacts"]:
                 arc_path = entry["path"]
-                packed_bytes = zf.read(arc_path)
+                packed_bytes = tf.extractfile(arc_path).read()
                 actual_sha = hashlib.sha256(packed_bytes).hexdigest()
                 assert actual_sha == entry["sha256"], (
                     f"Manifest sha256 for {arc_path!r} does not match packed bytes:\n"
@@ -563,27 +565,27 @@ class TestR2L1ManifestIntegrity:
                 )
 
     def test_manifest_size_matches_packed_bytes(self, tmp_path):
-        """For every artifact in the manifest, size must equal len(zip_bytes)."""
-        zip_path, repo = _write_zip(tmp_path)
-        with zipfile.ZipFile(zip_path) as zf:
-            manifest = json.loads(zf.read("manifest.json"))
+        """For every artifact in the manifest, size must equal len(bundle_bytes)."""
+        bundle_path, repo = _write_zip(tmp_path)
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
             for entry in manifest["artifacts"]:
                 arc_path = entry["path"]
-                packed_bytes = zf.read(arc_path)
+                packed_bytes = tf.extractfile(arc_path).read()
                 assert entry["size"] == len(packed_bytes), (
                     f"Manifest size for {arc_path!r} does not match packed bytes: "
                     f"manifest={entry['size']}, actual={len(packed_bytes)}"
                 )
 
     def test_manifest_sha256_for_known_content(self, tmp_path):
-        """Specific known-content artifact: klipper.bin sha256 must match bytes in zip."""
-        zip_path, repo = _write_zip(tmp_path)
+        """Specific known-content artifact: klipper.bin sha256 must match bytes in bundle."""
+        bundle_path, repo = _write_zip(tmp_path)
         # The fake repo writes b"klipper-captured-bin" to mcu-firmware/klipper.bin
         expected_sha = hashlib.sha256(b"klipper-captured-bin").hexdigest()
 
-        with zipfile.ZipFile(zip_path) as zf:
-            manifest = json.loads(zf.read("manifest.json"))
-            packed = zf.read("firmware/klipper.bin")
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
+            packed = tf.extractfile("firmware/klipper.bin").read()
 
         actual_sha = hashlib.sha256(packed).hexdigest()
         assert actual_sha == expected_sha, "klipper.bin sha256 mismatch"

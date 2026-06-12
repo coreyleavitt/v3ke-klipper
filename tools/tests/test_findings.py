@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tarfile
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -57,9 +58,10 @@ def _make_fake_repo(tmp_path: Path) -> Path:
     # c_helper.so lives in chelper/ (not in out/, not wiped)
     (repo / "external" / "klipper" / "klippy" / "chelper" / "c_helper.so").write_bytes(b"so")
 
-    # v3ke CLI binary
+    # v3ke CLI binaries — both platforms
     (repo / "tools" / "v3ke").mkdir(parents=True)
     (repo / "tools" / "v3ke" / "v3ke").write_bytes(b"nim binary")
+    (repo / "tools" / "v3ke" / "v3ke.exe").write_bytes(b"nim binary windows")
 
     # License files
     (repo / "LICENSE").write_text("repo license")
@@ -141,15 +143,15 @@ class TestC1KlipperBinSourcedFromCapture:
 
     def test_release_zip_klipper_bin_from_captured_location(self, tmp_path):
         """write_release_zip must package klipper.bin from mcu-firmware/ even when out/ is empty."""
-        zip_path, repo = _write_zip(tmp_path)
+        bundle_path, repo = _write_zip(tmp_path)
         # Verify out/ is empty (no klipper.bin there)
         assert not (repo / "external" / "klipper" / "out" / "klipper.bin").exists()
-        # The zip must still contain firmware/klipper.bin
-        with zipfile.ZipFile(zip_path) as zf:
-            assert "firmware/klipper.bin" in zf.namelist(), (
-                "firmware/klipper.bin must be present in zip even when out/ is empty"
+        # The bundle must still contain firmware/klipper.bin
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            assert "firmware/klipper.bin" in tf.getnames(), (
+                "firmware/klipper.bin must be present in bundle even when out/ is empty"
             )
-            content = zf.read("firmware/klipper.bin")
+            content = tf.extractfile("firmware/klipper.bin").read()
         assert content == b"klipper-captured-bin", (
             f"firmware/klipper.bin content should come from mcu-firmware/, got: {content!r}"
         )
@@ -177,13 +179,13 @@ class TestC2KlipperDictCaptureAndSource:
 
     def test_release_zip_klipper_dict_from_captured_location(self, tmp_path):
         """write_release_zip must package klipper.dict from mcu-firmware/ even when out/ is empty."""
-        zip_path, repo = _write_zip(tmp_path)
+        bundle_path, repo = _write_zip(tmp_path)
         assert not (repo / "external" / "klipper" / "out" / "klipper.dict").exists()
-        with zipfile.ZipFile(zip_path) as zf:
-            assert "host/klipper.dict" in zf.namelist(), (
-                "host/klipper.dict must be present in zip even when out/ is empty"
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            assert "host/klipper.dict" in tf.getnames(), (
+                "host/klipper.dict must be present in bundle even when out/ is empty"
             )
-            content = zf.read("host/klipper.dict")
+            content = tf.extractfile("host/klipper.dict").read()
         assert content == b"klipper-captured-dict", (
             f"host/klipper.dict content should come from mcu-firmware/, got: {content!r}"
         )
@@ -302,13 +304,13 @@ class TestCElfHostKlipperElfIsMips:
 
     def test_release_zip_klipper_elf_from_captured_location(self, tmp_path):
         """write_release_zip must package host/klipper.elf from mcu-firmware/ even when out/ is empty."""
-        zip_path, repo = _write_zip(tmp_path)
+        bundle_path, repo = _write_zip(tmp_path)
         assert not (repo / "external" / "klipper" / "out" / "klipper.elf").exists()
-        with zipfile.ZipFile(zip_path) as zf:
-            assert "host/klipper.elf" in zf.namelist(), (
-                "host/klipper.elf must be present in zip even when out/ is empty"
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            assert "host/klipper.elf" in tf.getnames(), (
+                "host/klipper.elf must be present in bundle even when out/ is empty"
             )
-            content = zf.read("host/klipper.elf")
+            content = tf.extractfile("host/klipper.elf").read()
         assert content == b"klipper-mips-elf", (
             f"host/klipper.elf content should come from mcu-firmware/klipper_mcu.elf, got: {content!r}"
         )
@@ -477,26 +479,26 @@ class TestM5ManifestNotInReleaseMembers:
         )
 
     def test_write_release_zip_still_contains_manifest(self, tmp_path):
-        """write_release_zip must still write manifest.json to the zip."""
-        zip_path, _ = _write_zip(tmp_path)
-        with zipfile.ZipFile(zip_path) as zf:
-            assert "manifest.json" in zf.namelist(), (
-                "manifest.json must still be in the zip after M5 refactor"
+        """write_release_zip must still write manifest.json to the linux bundle."""
+        bundle_path, _ = _write_zip(tmp_path)
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            assert "manifest.json" in tf.getnames(), (
+                "manifest.json must still be in the bundle after M5 refactor"
             )
 
     def test_manifest_in_zip_is_valid_json(self, tmp_path):
-        """manifest.json in the zip must be valid JSON with _type field."""
-        zip_path, _ = _write_zip(tmp_path)
-        with zipfile.ZipFile(zip_path) as zf:
-            manifest = json.loads(zf.read("manifest.json"))
+        """manifest.json in the bundle must be valid JSON with _type field."""
+        bundle_path, _ = _write_zip(tmp_path)
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
         assert manifest["_type"] == "v3ke-build"
 
     def test_manifest_validates_against_schema(self, tmp_path):
-        """manifest.json in the zip must pass schema validation."""
+        """manifest.json in the bundle must pass schema validation."""
         from build.release import validate_manifest
-        zip_path, _ = _write_zip(tmp_path)
-        with zipfile.ZipFile(zip_path) as zf:
-            manifest = json.loads(zf.read("manifest.json"))
+        bundle_path, _ = _write_zip(tmp_path)
+        with tarfile.open(bundle_path, "r:xz") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
         validate_manifest(manifest)  # must not raise
 
 
