@@ -2,8 +2,14 @@
 
 Public interface (pure — heavily unit-tested):
   ReleaseError
-      Exception raised by resolve_version when the VERSION file is missing,
-      empty, or malformed.
+      Exception raised by release helpers when the pipeline cannot proceed.
+
+  ReleasePlatform
+      Frozen dataclass describing one release target OS.
+
+  RELEASE_PLATFORMS
+      Tuple of the two supported ReleasePlatform instances:
+      ``linux-amd64`` (tar.xz) and ``windows-amd64`` (zip).
 
   resolve_version(repo_root) -> str
       Reads ``<repo_root>/VERSION``, strips whitespace, validates bare semver.
@@ -23,29 +29,44 @@ Public interface (pure — heavily unit-tested):
   hash_artifact(path, arcname) -> dict
       {"name": basename, "path": arcname, "sha256": hexdigest, "size": bytes}
 
-  release_members(repo_root, *, version) -> list[tuple[Path, str]]
-      Pure plan: (source_path, archive_name) for every file in the release zip.
+  release_members(repo_root, *, version, platform=<linux-amd64>) -> list[tuple[Path, str]]
+      Pure plan: (source_path, archive_name) for every file in the bundle.
+      The CLI member is chosen from platform.cli_source / cli_arcname.
+      manifest.json is NOT included — appended by write_release_bundles.
+
+  bundle_name(version, platform) -> str
+      ``f"v3ke-{version}-{platform.name}.{platform.fmt}"``
+      e.g. ``"v3ke-0.1.0-linux-amd64.tar.xz"`` / ``"v3ke-0.1.0-windows-amd64.zip"``
 
   release_zip_name(version) -> str
-      "v3ke-<version>-linux-amd64.zip"
+      Compatibility alias: ``bundle_name(version, linux_platform)``.
+      Preserved so callers that used the old single-zip API continue to compile.
 
   validate_manifest(manifest, *, schema_path=<...>) -> None
       jsonschema.validate; let ValidationError propagate.
 
 Thin I/O:
-  write_release_zip(repo_root, out_dir, *, version, commit, source_date_epoch,
-                    toolchain, reproducible) -> Path
-      Hash real files, build+validate manifest, write deterministic zip.
-      Returns the zip path.
+  write_release_bundles(repo_root, out_dir, *, version, commit, source_date_epoch,
+                        toolchain, reproducible, platforms=RELEASE_PLATFORMS,
+                        _submodule_provenance=None) -> list[Path]
+      Build manifest once from the 5 device artifacts, then write one bundle per
+      platform in its native format (tar.xz or zip).  Returns the list of written
+      paths.  Raises ReleaseError if any platform's CLI source is absent.
 
-Archive layout
-──────────────
+  write_release_zip(repo_root, out_dir, *, version, commit, source_date_epoch,
+                    toolchain, reproducible, _submodule_provenance=None) -> Path
+      Compatibility alias: calls write_release_bundles for all platforms and
+      returns the linux bundle path.  Preserved so existing tests continue to work.
+
+Bundle layout (per platform — identical except for CLI name)
+────────────────────────────────────────────────────────────
   firmware/katapult.bin
   firmware/klipper.bin
   host/c_helper.so
   host/klipper.elf
   host/klipper.dict
-  v3ke
+  v3ke              ← linux-amd64
+  v3ke.exe          ← windows-amd64
   INSTALL.md
   SOURCES.md
   manifest.json
@@ -57,26 +78,76 @@ Archive layout
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import io
 import json
 import re
 import subprocess
+import tarfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 __all__ = [
+    "ReleasePlatform",
+    "RELEASE_PLATFORMS",
     "ReleaseError",
     "resolve_version",
     "submodule_provenance",
     "build_manifest",
     "hash_artifact",
     "release_members",
+    "bundle_name",
     "release_zip_name",
     "validate_manifest",
+    "write_release_bundles",
     "write_release_zip",
 ]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Platform descriptors
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclasses.dataclass(frozen=True)
+class ReleasePlatform:
+    """Immutable descriptor for one release target OS.
+
+    Attributes
+    ----------
+    name:
+        Canonical platform slug used in bundle filenames, e.g. ``"linux-amd64"``.
+    cli_source:
+        Repo-root-relative path to the CLI binary for this platform,
+        e.g. ``"tools/v3ke/v3ke"`` or ``"tools/v3ke/v3ke.exe"``.
+    cli_arcname:
+        Archive member name for the CLI binary, e.g. ``"v3ke"`` or ``"v3ke.exe"``.
+    fmt:
+        Archive format: ``"tar.xz"`` (Linux) or ``"zip"`` (Windows).
+    """
+
+    name: str
+    cli_source: str
+    cli_arcname: str
+    fmt: str
+
+
+RELEASE_PLATFORMS: tuple[ReleasePlatform, ...] = (
+    ReleasePlatform(
+        name="linux-amd64",
+        cli_source="tools/v3ke/v3ke",
+        cli_arcname="v3ke",
+        fmt="tar.xz",
+    ),
+    ReleasePlatform(
+        name="windows-amd64",
+        cli_source="tools/v3ke/v3ke.exe",
+        cli_arcname="v3ke.exe",
+        fmt="zip",
+    ),
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Schema path
@@ -327,44 +398,52 @@ def release_members(
     repo_root: Path,
     *,
     version: str,
+    platform: Optional[ReleasePlatform] = None,
 ) -> list[tuple[Path, str]]:
-    """Return the ordered plan of (source_path, archive_name) for the release zip.
+    """Return the ordered plan of (source_path, archive_name) for a release bundle.
 
     All artifact source paths point to ``mcu-firmware/`` (the canonical captured
     locations) rather than ``external/klipper/out/``, which is wiped by the host
     ``make clean`` and must never be used at packaging time.
 
     manifest.json is NOT included here — it is appended directly by
-    write_release_zip after it is computed, so it never needs a sentinel path.
+    write_release_bundles after it is computed, so it never needs a sentinel path.
 
-    Archive layout:
+    Bundle layout (common across platforms):
       firmware/katapult.bin
       firmware/klipper.bin           ← mcu-firmware/klipper.bin
       host/c_helper.so
       host/klipper.elf               ← mcu-firmware/klipper_mcu.elf
       host/klipper.dict              ← mcu-firmware/klipper.dict
-      v3ke
+      <cli_arcname>                  ← determined by platform (v3ke or v3ke.exe)
       INSTALL.md
       SOURCES.md
       LICENSES/v3ke.LICENSE
       LICENSES/klipper.LICENSE       (from external/klipper/COPYING)
       LICENSES/katapult.LICENSE
       LICENSES/mainsail-config.LICENSE
-      manifest.json                  (appended by write_release_zip)
+      manifest.json                  (appended by write_release_bundles)
 
     Parameters
     ----------
     repo_root:
         Absolute path to the repository root.
     version:
-        Release version (used only for future extension; currently unused).
+        Release version (reserved for future extension; currently unused in body).
+    platform:
+        The :class:`ReleasePlatform` that determines the CLI source path and its
+        archive name.  Defaults to the ``linux-amd64`` platform for backward
+        compatibility with callers that pre-date the multi-platform API.
 
     Returns
     -------
     list of (Path, str)
         Ordered (source_path, archive_name) pairs.  Does NOT include
-        manifest.json — that is appended by write_release_zip.
+        manifest.json — that is appended by write_release_bundles.
     """
+    if platform is None:
+        platform = RELEASE_PLATFORMS[0]  # linux-amd64 default
+
     r = Path(repo_root)
 
     members: list[tuple[Path, str]] = [
@@ -379,8 +458,8 @@ def release_members(
         (r / "mcu-firmware" / "klipper_mcu.elf",                      "host/klipper.elf"),
         # klipper.dict: captured to mcu-firmware/ before host clean wipes out/
         (r / "mcu-firmware" / "klipper.dict",                         "host/klipper.dict"),
-        # v3ke CLI binary
-        (r / "tools" / "v3ke" / "v3ke",                                "v3ke"),
+        # Platform CLI binary — arcname differs between linux (v3ke) and windows (v3ke.exe)
+        (r / platform.cli_source,                                      platform.cli_arcname),
         # Human-readable files (from bundled release_assets)
         (_RELEASE_ASSETS / "INSTALL.md",                               "INSTALL.md"),
         (_RELEASE_ASSETS / "SOURCES.md",                               "SOURCES.md"),
@@ -394,15 +473,34 @@ def release_members(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. release_zip_name
+# 6. bundle_name  (replaces the old release_zip_name)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def release_zip_name(version: str) -> str:
-    """Return the canonical zip filename for a release.
+def bundle_name(version: str, platform: ReleasePlatform) -> str:
+    """Return the canonical bundle filename for *version* on *platform*.
 
-    Pattern: ``v3ke-<version>-linux-amd64.zip``
+    Pattern: ``v3ke-<version>-<platform.name>.<platform.fmt>``
+
+    Examples
+    --------
+    >>> bundle_name("0.1.0", linux_platform)
+    "v3ke-0.1.0-linux-amd64.tar.xz"
+    >>> bundle_name("0.1.0", windows_platform)
+    "v3ke-0.1.0-windows-amd64.zip"
     """
-    return f"v3ke-{version}-linux-amd64.zip"
+    return f"v3ke-{version}-{platform.name}.{platform.fmt}"
+
+
+def release_zip_name(version: str) -> str:
+    """Backward-compatibility alias for :func:`bundle_name` with the linux platform.
+
+    .. deprecated::
+        Use ``bundle_name(version, platform)`` for new code.
+        Retained so old callers that reference the single-zip name continue to
+        compile without changes.
+    """
+    linux = RELEASE_PLATFORMS[0]  # linux-amd64
+    return bundle_name(version, linux)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -436,8 +534,234 @@ def validate_manifest(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Thin I/O: write_release_zip
+# Thin I/O: write_release_bundles
 # ──────────────────────────────────────────────────────────────────────────────
+
+#: The 5 device artifact archive paths hashed into the manifest.
+#: Identical across all platforms — the manifest is OS-independent.
+_DEVICE_ARCNAMES: frozenset[str] = frozenset({
+    "firmware/katapult.bin",
+    "firmware/klipper.bin",
+    "host/c_helper.so",
+    "host/klipper.elf",
+    "host/klipper.dict",
+})
+
+
+def _write_zip_bundle(
+    path: Path,
+    member_bytes: list[tuple[str, bytes]],
+    manifest_json: bytes,
+    fixed_mtime: tuple[int, int, int, int, int, int],
+) -> None:
+    """Write a deterministic zip bundle at *path*."""
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for arcname, data in member_bytes:
+            info = zipfile.ZipInfo(arcname, date_time=fixed_mtime)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, data)
+        manifest_info = zipfile.ZipInfo("manifest.json", date_time=fixed_mtime)
+        zf.writestr(manifest_info, manifest_json)
+
+
+def _write_tar_xz_bundle(
+    path: Path,
+    member_bytes: list[tuple[str, bytes]],
+    manifest_json: bytes,
+    source_date_epoch: int,
+    cli_arcname: str,
+) -> None:
+    """Write a deterministic tar.xz bundle at *path*.
+
+    Every TarInfo is built manually — never via ``gettarinfo`` — so that real
+    filesystem metadata (mtime, uid, gid, mode) is never captured.  This is the
+    key to byte-for-byte reproducibility regardless of the host environment.
+
+    Member order mirrors the zip helper so both archives have an identical,
+    predictable layout.
+    """
+    with tarfile.open(path, "w:xz", format=tarfile.GNU_FORMAT) as tf:
+        for arcname, data in member_bytes:
+            ti = tarfile.TarInfo(name=arcname)
+            ti.size = len(data)
+            ti.mtime = source_date_epoch
+            ti.uid = 0
+            ti.gid = 0
+            ti.uname = ""
+            ti.gname = ""
+            # CLI binary gets executable bits; everything else is a regular file.
+            ti.mode = 0o755 if arcname == cli_arcname else 0o644
+            tf.addfile(ti, io.BytesIO(data))
+        # Append manifest.json with the same fixed metadata
+        mti = tarfile.TarInfo(name="manifest.json")
+        mti.size = len(manifest_json)
+        mti.mtime = source_date_epoch
+        mti.uid = 0
+        mti.gid = 0
+        mti.uname = ""
+        mti.gname = ""
+        mti.mode = 0o644
+        tf.addfile(mti, io.BytesIO(manifest_json))
+
+
+def write_release_bundles(
+    repo_root: Path,
+    out_dir: Path,
+    *,
+    version: str,
+    commit: str,
+    source_date_epoch: int,
+    toolchain: dict,
+    reproducible: bool,
+    platforms: Sequence[ReleasePlatform] = RELEASE_PLATFORMS,
+    _submodule_provenance: Optional[Callable] = None,
+) -> list[Path]:
+    """Build and write one self-contained bundle per platform.
+
+    The manifest is computed ONCE from the 5 device artifacts (which are
+    identical across all platforms) and embedded byte-for-byte into every
+    bundle and into the standalone ``out_dir/manifest.json``.
+
+    Parameters
+    ----------
+    repo_root:
+        Absolute path to the repository root.
+    out_dir:
+        Directory in which to write bundles and the standalone manifest.json.
+    version:
+        Release version string (bare semver, no 'v' prefix).
+    commit:
+        Repository HEAD SHA.
+    source_date_epoch:
+        Unix timestamp (int) used for deterministic timestamps in archives.
+    toolchain:
+        Toolchain version dict (``{"mips": {...}, "arm": {...}}``).
+    reproducible:
+        Whether this build has been verified reproducible.
+    platforms:
+        Sequence of :class:`ReleasePlatform` instances to package.
+        Defaults to :data:`RELEASE_PLATFORMS` (linux + windows).
+    _submodule_provenance:
+        Injectable override for :func:`submodule_provenance` (unit tests pass a
+        stub; omit in production to use real git calls).
+
+    Returns
+    -------
+    list[Path]
+        Absolute paths to the written bundle files, one per platform, in the
+        same order as *platforms*.
+
+    Raises
+    ------
+    ReleaseError
+        If any platform's CLI source file is missing from the repo tree.
+        The error message names both the missing file and the platform.
+    """
+    repo_root = Path(repo_root)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. Validate CLI sources up-front (fail fast, informative message) ──────
+    for plat in platforms:
+        cli_path = repo_root / plat.cli_source
+        if not cli_path.exists():
+            raise ReleaseError(
+                f"CLI binary for platform {plat.name!r} not found: {cli_path} "
+                f"(expected at {plat.cli_source!r} relative to repo root). "
+                f"Build the Nim CLI before packaging."
+            )
+
+    # ── 2. Resolve submodule provenance ─────────────────────────────────────
+    _prov_fn = _submodule_provenance or submodule_provenance
+    submodules = _prov_fn(repo_root)
+
+    # ── 3. Read device-artifact bytes once via the linux plan ────────────────
+    # The device artifacts are platform-independent.  We read them once using
+    # any platform's member plan (linux chosen by convention); the CLI entry
+    # is excluded from hashing via _DEVICE_ARCNAMES.
+    linux_platform = RELEASE_PLATFORMS[0]  # linux-amd64
+    linux_members = release_members(repo_root, version=version, platform=linux_platform)
+
+    # (arcname -> (src_path, bytes)) for all members in the linux plan.
+    # This preserves the canonical order for zip-format bundles.
+    linux_member_bytes: list[tuple[str, bytes]] = []
+    artifact_dicts: list[dict] = []
+
+    for src, arcname in linux_members:
+        data = src.read_bytes()
+        linux_member_bytes.append((arcname, data))
+        if arcname in _DEVICE_ARCNAMES:
+            sha = hashlib.sha256(data).hexdigest()
+            artifact_dicts.append({
+                "name": src.name,
+                "path": arcname,
+                "sha256": sha,
+                "size": len(data),
+            })
+
+    # ── 4. Build and validate the shared manifest ────────────────────────────
+    manifest = build_manifest(
+        version=version,
+        commit=commit,
+        source_date_epoch=source_date_epoch,
+        toolchain=toolchain,
+        submodules=submodules,
+        artifacts=artifact_dicts,
+        reproducible=reproducible,
+    )
+    validate_manifest(manifest)
+    manifest_json_str = json.dumps(manifest, indent=2, sort_keys=True)
+    manifest_json: bytes = manifest_json_str.encode("utf-8")
+
+    # ── 5. Write the standalone manifest.json ────────────────────────────────
+    (out_dir / "manifest.json").write_bytes(manifest_json)
+
+    # ── 6. Deterministic mtime tuple (for zip format) ────────────────────────
+    epoch_dt = datetime.fromtimestamp(source_date_epoch, tz=timezone.utc)
+    fixed_mtime = (
+        epoch_dt.year, epoch_dt.month, epoch_dt.day,
+        epoch_dt.hour, epoch_dt.minute, epoch_dt.second,
+    )
+
+    # ── 7. Write one bundle per platform ─────────────────────────────────────
+    written: list[Path] = []
+
+    # Build an index of linux bytes by arcname for O(1) lookup when assembling
+    # per-platform member lists (we replace the CLI entry).
+    linux_bytes_by_arcname: dict[str, bytes] = dict(linux_member_bytes)
+
+    for plat in platforms:
+        # Assemble this platform's member list: same as linux except CLI entry.
+        plat_members = release_members(repo_root, version=version, platform=plat)
+        plat_member_bytes: list[tuple[str, bytes]] = []
+        for src, arcname in plat_members:
+            if arcname == plat.cli_arcname:
+                # Read CLI bytes directly (may differ from linux CLI bytes)
+                data = src.read_bytes()
+            else:
+                # Reuse already-read device/doc/license bytes — no second read
+                data = linux_bytes_by_arcname[arcname]
+            plat_member_bytes.append((arcname, data))
+
+        name = bundle_name(version, plat)
+        out_path = out_dir / name
+
+        if plat.fmt == "zip":
+            _write_zip_bundle(out_path, plat_member_bytes, manifest_json, fixed_mtime)
+        elif plat.fmt == "tar.xz":
+            _write_tar_xz_bundle(
+                out_path, plat_member_bytes, manifest_json,
+                source_date_epoch, plat.cli_arcname,
+            )
+        else:
+            raise ReleaseError(
+                f"Unsupported bundle format {plat.fmt!r} for platform {plat.name!r}."
+            )
+
+        written.append(out_path)
+
+    return written
+
 
 def write_release_zip(
     repo_root: Path,
@@ -450,107 +774,24 @@ def write_release_zip(
     reproducible: bool,
     _submodule_provenance: Optional[Callable] = None,
 ) -> Path:
-    """Hash real artifacts, build+validate the manifest, write the release zip.
+    """Backward-compatibility shim: write all platform bundles and return the linux path.
 
-    This is the only I/O-performing function in the module.  All decisions are
-    delegated to the pure helpers above.
+    .. deprecated::
+        New code should call :func:`write_release_bundles` directly.
+        This shim is retained so existing tests and callers that expected a single
+        returned :class:`~pathlib.Path` continue to work without modification.
 
-    Parameters
-    ----------
-    repo_root:
-        Absolute path to the repository root.
-    out_dir:
-        Directory in which to write the zip.
-    version:
-        Release version string.
-    commit:
-        Repository HEAD SHA.
-    source_date_epoch:
-        Unix timestamp (int) used for deterministic timestamps inside the zip.
-    toolchain:
-        Toolchain version dict (``{"mips": {...}, "arm": {...}}``).
-    reproducible:
-        Whether this build has been verified reproducible.
-    _submodule_provenance:
-        Injectable override for ``submodule_provenance`` (unit tests pass a
-        stub; omit in production).
-
-    Returns
-    -------
-    Path
-        Absolute path to the written zip file.
+    Returns the path to the ``linux-amd64.tar.xz`` bundle.
     """
-    repo_root = Path(repo_root)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Resolve submodule provenance (real git calls, or injected stub for tests)
-    _prov_fn = _submodule_provenance or submodule_provenance
-    submodules = _prov_fn(repo_root)
-
-    # Get the member plan (manifest.json is NOT in the list — appended below)
-    members = release_members(repo_root, version=version)
-
-    # Read each artifact's bytes ONCE — the same bytes are used for both the
-    # manifest sha256 and the zip payload.  Two reads would risk the manifest
-    # attesting different bytes than what was packed (R2-L1).
-    artifact_arcnames = {
-        "firmware/katapult.bin", "firmware/klipper.bin",
-        "host/c_helper.so", "host/klipper.elf", "host/klipper.dict",
-    }
-    member_bytes: list[tuple[str, bytes]] = []  # (arcname, raw_bytes) in members order
-    artifact_dicts: list[dict] = []
-    for src, arcname in members:
-        data = src.read_bytes()
-        member_bytes.append((arcname, data))
-        if arcname in artifact_arcnames:
-            sha = hashlib.sha256(data).hexdigest()
-            artifact_dicts.append({
-                "name": src.name,
-                "path": arcname,
-                "sha256": sha,
-                "size": len(data),
-            })
-
-    # Build and validate the manifest
-    manifest = build_manifest(
+    paths = write_release_bundles(
+        repo_root,
+        out_dir,
         version=version,
         commit=commit,
         source_date_epoch=source_date_epoch,
         toolchain=toolchain,
-        submodules=submodules,
-        artifacts=artifact_dicts,
         reproducible=reproducible,
+        _submodule_provenance=_submodule_provenance,
     )
-    validate_manifest(manifest)
-    manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
-
-    # Build the final zip with deterministic member order + fixed mtime.
-    # Write from the already-read bytes (no second read).
-    zip_name = release_zip_name(version)
-    zip_path = out_dir / zip_name
-
-    # Fixed mtime tuple for reproducibility: (year, month, day, hour, min, sec)
-    epoch_dt = datetime.fromtimestamp(source_date_epoch, tz=timezone.utc)
-    fixed_mtime = (
-        epoch_dt.year, epoch_dt.month, epoch_dt.day,
-        epoch_dt.hour, epoch_dt.minute, epoch_dt.second,
-    )
-
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for arcname, data in member_bytes:
-            info = zipfile.ZipInfo(arcname, date_time=fixed_mtime)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            zf.writestr(info, data)
-        # Append manifest.json directly — not via release_members() sentinel
-        manifest_info = zipfile.ZipInfo("manifest.json", date_time=fixed_mtime)
-        zf.writestr(manifest_info, manifest_json)
-
-    # Also write a standalone manifest.json next to the zip. The release flow
-    # checksums (and signs) the zip AND a standalone manifest.json, and publishes
-    # manifest.json as its own release asset — so consumers can read provenance
-    # without unzipping, and the cosign-signed SHA256SUMS covers it. Same bytes
-    # as the copy embedded in the zip.
-    (out_dir / "manifest.json").write_text(manifest_json, encoding="utf-8")
-
-    return zip_path
+    # Return the linux bundle path (first in RELEASE_PLATFORMS order)
+    return next(p for p in paths if "linux-amd64" in p.name)

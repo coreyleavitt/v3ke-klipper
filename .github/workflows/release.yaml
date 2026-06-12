@@ -430,17 +430,31 @@ jobs:
           version: "0.11.19"
 
       # -----------------------------------------------------------------------
-      # 10. Package release zip
+      # 10. Fetch the Windows v3ke.exe (from build-v3ke-windows) INTO the source
+      # tree at tools/v3ke/v3ke.exe, BEFORE packaging — the packager bundles it
+      # into the Windows .zip (it is not a loose asset).
+      # -----------------------------------------------------------------------
+      - name: Fetch Windows v3ke.exe into the tree
+        # actions/download-artifact v4.1.8 — SHA-pinned.
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.1.8
+        with:
+          name: v3ke-windows-exe
+          path: tools/v3ke
+
+      # -----------------------------------------------------------------------
+      # 11. Package release bundles
       #
-      # Produces dist/v3ke-<version>-linux-amd64.zip + dist/manifest.json.
-      # --reproducible is justified: the repro gate (step 5) proved byte-identical
-      # output across two independent cold builds.
+      # Produces TWO self-contained per-OS bundles + dist/manifest.json:
+      #   dist/v3ke-<version>-linux-amd64.tar.xz   (contains v3ke)
+      #   dist/v3ke-<version>-windows-amd64.zip    (contains v3ke.exe)
+      # Both embed the same OS-independent provenance manifest. --reproducible is
+      # justified: the repro gate (step 5) proved byte-identical device artifacts.
       #
       # Run under `uv run --project tools` so jsonschema (pinned in tools/uv.lock)
-      # is available for manifest validation.  Executed from the repo root so
-      # dist/ lands at the repo root (the SHA256SUMS step does `cd dist`).
+      # is available for manifest validation. From the repo root so dist/ lands
+      # there (the SHA256SUMS step does `cd dist`).
       # -----------------------------------------------------------------------
-      - name: Package release zip
+      - name: Package release bundles
         run: |
           IMAGE_REF="${{ steps.pull.outputs.image_ref }}"
           uv run --project tools python tools/build.py \
@@ -451,29 +465,15 @@ jobs:
             --toolchain-versions toolchain-versions.json
 
       # -----------------------------------------------------------------------
-      # 11. SHA256SUMS — compute checksums over all release assets
+      # 12. SHA256SUMS — checksums over BOTH bundles + manifest.json
       #
-      # Covers the zip AND manifest.json so the cosign signature transitively
-      # authenticates the build provenance record.
+      # Covers the linux .tar.xz, the windows .zip, and manifest.json so the
+      # cosign signature transitively authenticates everything published.
       # -----------------------------------------------------------------------
-      # Pull the Windows v3ke.exe from the build-v3ke-windows job and name it per
-      # the release convention. It's a loose per-OS asset (the firmware/host
-      # artifacts in the zip are OS-independent); the cosign-signed SHA256SUMS
-      # below covers it too.
-      - name: Download Windows v3ke.exe
-        # actions/download-artifact v4.1.8 — SHA-pinned.
-        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.1.8
-        with:
-          name: v3ke-windows-exe
-          path: dist
-      - name: Name the Windows exe per release convention
-        run: |
-          mv "dist/v3ke.exe" "dist/v3ke-${{ needs.prepare-version.outputs.version }}-windows-amd64.exe"
-
       - name: Compute SHA256SUMS
         run: |
           cd dist
-          sha256sum v3ke-*-linux-amd64.zip v3ke-*-windows-amd64.exe manifest.json > SHA256SUMS
+          sha256sum v3ke-*-linux-amd64.tar.xz v3ke-*-windows-amd64.zip manifest.json > SHA256SUMS
           echo "--- SHA256SUMS ---"
           cat SHA256SUMS
 
@@ -527,7 +527,8 @@ jobs:
       # --prerelease:     set when the version has an -alpha/-beta/-rc suffix.
       # Idempotency: gh release create already errors if a release for the tag
       # exists, so no extra flag is needed (there is no --fail-if-exists flag).
-      # Assets: linux zip, Windows v3ke.exe, SHA256SUMS, SHA256SUMS.sig, manifest.json.
+      # Assets: linux .tar.xz bundle, windows .zip bundle, SHA256SUMS,
+      # SHA256SUMS.sig, manifest.json.
       # -----------------------------------------------------------------------
       - name: Create GitHub Release
         env:
@@ -541,8 +542,8 @@ jobs:
           gh release create "${TAG}" \
             --generate-notes \
             ${PRERELEASE_FLAG} \
-            dist/v3ke-*-linux-amd64.zip \
-            dist/v3ke-*-windows-amd64.exe \
+            dist/v3ke-*-linux-amd64.tar.xz \
+            dist/v3ke-*-windows-amd64.zip \
             dist/SHA256SUMS \
             dist/SHA256SUMS.sig \
             dist/manifest.json

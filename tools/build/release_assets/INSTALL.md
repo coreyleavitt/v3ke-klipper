@@ -1,6 +1,9 @@
 # Installation
 
-This zip is flash-ready for the Ender 3 V3 KE running the mainline Klipper port.
+This bundle is flash-ready for the Ender 3 V3 KE running the mainline Klipper port.
+It ships as a per-OS archive — `…-linux-amd64.tar.xz` (contains `v3ke`) or
+`…-windows-amd64.zip` (contains `v3ke.exe`). The device artifacts are identical in
+both; only the hardware-ops CLI differs by host OS.
 
 ## Contents
 
@@ -11,7 +14,7 @@ This zip is flash-ready for the Ender 3 V3 KE running the mainline Klipper port.
 | `host/c_helper.so` | Klipper C helper extension (MIPS, cross-compiled for the Nebula Pad) |
 | `host/klipper.elf` | Klipper host MCU ELF (ABI-verified: nan2008/fp64) |
 | `host/klipper.dict` | Klipper data dictionary |
-| `v3ke` | Hardware-ops CLI: flash, verify, backup |
+| `v3ke` / `v3ke.exe` | Hardware-ops CLI: flash, verify, backup (Linux / Windows) |
 | `INSTALL.md` | This file |
 | `SOURCES.md` | GPL source offer |
 | `manifest.json` | Build-provenance attestation (sha256, toolchain versions, submodule commits) |

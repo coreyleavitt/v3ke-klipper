@@ -113,7 +113,7 @@ def cmd_release(a):
     from build.release import (
         resolve_version,
         submodule_provenance,
-        write_release_zip,
+        write_release_bundles,
     )
     from build.arm_mcu import resolve_source_date_epoch
 
@@ -147,7 +147,7 @@ def cmd_release(a):
 
     reproducible = getattr(a, "reproducible", False)
 
-    zip_path = write_release_zip(
+    bundle_paths = write_release_bundles(
         repo_root=REPO,
         out_dir=out_dir,
         version=version,
@@ -156,7 +156,8 @@ def cmd_release(a):
         toolchain=toolchain,
         reproducible=reproducible,
     )
-    print(f"release: {zip_path}")
+    for p in bundle_paths:
+        print(f"release: {p}")
 
 
 def main():

@@ -678,7 +678,8 @@ def test_gh_release_create_uses_tag_from_prepare_version(release_steps: list[dic
 
 
 # ---------------------------------------------------------------------------
-# Windows v3ke.exe — build-v3ke-windows job + loose per-OS signed asset
+# Windows v3ke.exe — build-v3ke-windows job + per-OS bundles
+# (linux .tar.xz with v3ke, windows .zip with v3ke.exe)
 # ---------------------------------------------------------------------------
 
 
@@ -719,15 +720,34 @@ def test_release_needs_windows_job(release_job: dict):
     assert "build-v3ke-windows" in needs, "release job must need build-v3ke-windows"
 
 
-def test_sha256sums_covers_windows_exe(release_steps: list[dict]):
-    """SHA256SUMS (which cosign signs) must cover the Windows .exe asset."""
-    assert steps_contain(release_steps, "sha256sum", "windows-amd64.exe"), (
-        "SHA256SUMS step must include v3ke-*-windows-amd64.exe"
+def test_windows_exe_fetched_into_tree_before_packaging(release_steps: list[dict]):
+    """The Windows exe must be downloaded into tools/v3ke (not dist) so the packager
+    bundles it into the windows .zip — and before the packaging step."""
+    fetch_idx = step_index(release_steps, "download-artifact", "tools/v3ke")
+    pkg_idx = step_index(release_steps, "build.py", "release")
+    assert fetch_idx >= 0, (
+        "release job must download the windows exe into tools/v3ke (download-artifact, path: tools/v3ke)"
+    )
+    assert pkg_idx >= 0 and fetch_idx < pkg_idx, (
+        "the windows exe must be fetched BEFORE the packaging step"
     )
 
 
-def test_release_uploads_windows_exe(release_steps: list[dict]):
-    """gh release create must publish the Windows .exe asset."""
-    assert steps_contain(release_steps, "gh release create", "windows-amd64.exe"), (
-        "gh release create must upload v3ke-*-windows-amd64.exe"
+def test_sha256sums_covers_both_bundles(release_steps: list[dict]):
+    """SHA256SUMS (which cosign signs) must cover both per-OS bundles."""
+    assert steps_contain(release_steps, "sha256sum", "linux-amd64.tar.xz"), (
+        "SHA256SUMS step must include the linux .tar.xz bundle"
+    )
+    assert steps_contain(release_steps, "sha256sum", "windows-amd64.zip"), (
+        "SHA256SUMS step must include the windows .zip bundle"
+    )
+
+
+def test_release_uploads_both_bundles(release_steps: list[dict]):
+    """gh release create must publish both per-OS bundles (no loose .exe)."""
+    assert steps_contain(release_steps, "gh release create", "linux-amd64.tar.xz"), (
+        "gh release create must upload v3ke-*-linux-amd64.tar.xz"
+    )
+    assert steps_contain(release_steps, "gh release create", "windows-amd64.zip"), (
+        "gh release create must upload v3ke-*-windows-amd64.zip"
     )
