@@ -193,7 +193,55 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ---------------------------------------------------------------------------
-  # Job 2: release
+  # Job 2: build-v3ke-windows — compile the Windows v3ke.exe (custom nim + VCC).
+  #
+  # Uses the pinned, self-contained Windows toolchain image
+  # (ghcr.io/coreyleavitt/nim:2.2.10-windows — Corey's backported nim 2.2.10 +
+  # MSVC/VCC, Windows build 26100). docker-run on a windows-2025 runner (also
+  # build 26100) so Windows-container process isolation versions match; a
+  # windows-2022 (20348) runner could NOT run a 26100 container. The native VCC
+  # toolchain inside the image yields a clean, runtime-free .exe (no MinGW DLLs).
+  # The .exe is uploaded for the release job to checksum, cosign-sign, and publish
+  # as a loose per-OS asset (the firmware/host artifacts are OS-independent).
+  # ---------------------------------------------------------------------------
+  build-v3ke-windows:
+    name: Build v3ke.exe (Windows · custom nim + VCC)
+    runs-on: windows-2025
+    needs: prepare-version
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout release tag
+        # actions/checkout v4.2.2 — SHA-pinned.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare-version.outputs.tag }}
+          fetch-depth: 0
+
+      # Build inside the pinned Windows image. The repo is bind-mounted at C:\app
+      # (the image pre-sets `git config --global safe.directory C:\app` so the
+      # compile-time `git describe` in version.nim works on the mounted checkout).
+      # Pin the image by digest — fail-closed, same discipline as the toolchain image.
+      - name: Build v3ke.exe (custom nim + VCC, pinned image)
+        shell: pwsh
+        run: |
+          $img = "ghcr.io/coreyleavitt/nim@sha256:0d179a901fb58ecf6b24fbcc16b97a18cffa5f94672f759c039adfc4b470ef85"
+          docker run --rm -v "${{ github.workspace }}:C:\app" -w C:\app\tools\v3ke `
+            $img `
+            nim c -d:release --cc:vcc -o:v3ke.exe v3ke.nim
+          if (-not (Test-Path tools\v3ke\v3ke.exe)) { throw "v3ke.exe was not produced" }
+
+      - name: Upload v3ke.exe
+        # actions/upload-artifact v4.4.3 — SHA-pinned.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.4.3
+        with:
+          name: v3ke-windows-exe
+          path: tools/v3ke/v3ke.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 3: release
   #
   # Checks out the exact tag/commit created by prepare-version, verifies
   # submodule integrity, pulls the toolchain image by digest (hard fail),
@@ -202,7 +250,7 @@ jobs:
   release:
     name: Build, sign, and publish release
     runs-on: ubuntu-latest
-    needs: prepare-version
+    needs: [prepare-version, build-v3ke-windows]
 
     permissions:
       contents: write
@@ -408,10 +456,24 @@ jobs:
       # Covers the zip AND manifest.json so the cosign signature transitively
       # authenticates the build provenance record.
       # -----------------------------------------------------------------------
+      # Pull the Windows v3ke.exe from the build-v3ke-windows job and name it per
+      # the release convention. It's a loose per-OS asset (the firmware/host
+      # artifacts in the zip are OS-independent); the cosign-signed SHA256SUMS
+      # below covers it too.
+      - name: Download Windows v3ke.exe
+        # actions/download-artifact v4.1.8 — SHA-pinned.
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.1.8
+        with:
+          name: v3ke-windows-exe
+          path: dist
+      - name: Name the Windows exe per release convention
+        run: |
+          mv "dist/v3ke.exe" "dist/v3ke-${{ needs.prepare-version.outputs.version }}-windows-amd64.exe"
+
       - name: Compute SHA256SUMS
         run: |
           cd dist
-          sha256sum v3ke-*-linux-amd64.zip manifest.json > SHA256SUMS
+          sha256sum v3ke-*-linux-amd64.zip v3ke-*-windows-amd64.exe manifest.json > SHA256SUMS
           echo "--- SHA256SUMS ---"
           cat SHA256SUMS
 
@@ -465,7 +527,7 @@ jobs:
       # --prerelease:     set when the version has an -alpha/-beta/-rc suffix.
       # Idempotency: gh release create already errors if a release for the tag
       # exists, so no extra flag is needed (there is no --fail-if-exists flag).
-      # Assets: zip, SHA256SUMS, SHA256SUMS.sig, manifest.json.
+      # Assets: linux zip, Windows v3ke.exe, SHA256SUMS, SHA256SUMS.sig, manifest.json.
       # -----------------------------------------------------------------------
       - name: Create GitHub Release
         env:
@@ -480,6 +542,7 @@ jobs:
             --generate-notes \
             ${PRERELEASE_FLAG} \
             dist/v3ke-*-linux-amd64.zip \
+            dist/v3ke-*-windows-amd64.exe \
             dist/SHA256SUMS \
             dist/SHA256SUMS.sig \
             dist/manifest.json

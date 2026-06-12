@@ -675,3 +675,59 @@ def test_gh_release_create_uses_tag_from_prepare_version(release_steps: list[dic
             )
             return
     pytest.fail("No 'gh release create' step found in the release job")
+
+
+# ---------------------------------------------------------------------------
+# Windows v3ke.exe — build-v3ke-windows job + loose per-OS signed asset
+# ---------------------------------------------------------------------------
+
+
+def test_windows_v3ke_job_present(wf: dict):
+    """A build-v3ke-windows job builds the Windows CLI on a windows-2025 runner."""
+    jobs = wf.get("jobs", {})
+    assert "build-v3ke-windows" in jobs, "release.yaml must have a build-v3ke-windows job"
+    assert "windows-2025" in str(jobs["build-v3ke-windows"].get("runs-on", "")), (
+        "build-v3ke-windows must run on windows-2025 (build 26100) to match the "
+        "Windows container's build for process isolation (windows-2022 can't run it)"
+    )
+
+
+def test_windows_job_uses_pinned_image_and_vcc(wf: dict):
+    """The Windows build uses the digest-pinned custom nim image and compiles with VCC."""
+    steps = wf["jobs"]["build-v3ke-windows"].get("steps", [])
+    blob = "\n".join(str(s.get("run", "")) for s in steps)
+    assert "ghcr.io/coreyleavitt/nim@sha256:" in blob, (
+        "Windows build must pull the custom nim image pinned by @sha256: digest"
+    )
+    assert "--cc:vcc" in blob, "Windows build must compile with VCC (--cc:vcc), not MinGW"
+    assert "v3ke.exe" in blob, "Windows build must produce v3ke.exe"
+
+
+def test_windows_job_uploads_exe(wf: dict):
+    """The Windows job uploads v3ke.exe for the release job to consume."""
+    steps = wf["jobs"]["build-v3ke-windows"].get("steps", [])
+    assert any("actions/upload-artifact" in str(s.get("uses", "")) for s in steps), (
+        "build-v3ke-windows must upload v3ke.exe as an artifact"
+    )
+
+
+def test_release_needs_windows_job(release_job: dict):
+    """The release job depends on build-v3ke-windows (so the exe is available)."""
+    needs = release_job.get("needs", [])
+    if isinstance(needs, str):
+        needs = [needs]
+    assert "build-v3ke-windows" in needs, "release job must need build-v3ke-windows"
+
+
+def test_sha256sums_covers_windows_exe(release_steps: list[dict]):
+    """SHA256SUMS (which cosign signs) must cover the Windows .exe asset."""
+    assert steps_contain(release_steps, "sha256sum", "windows-amd64.exe"), (
+        "SHA256SUMS step must include v3ke-*-windows-amd64.exe"
+    )
+
+
+def test_release_uploads_windows_exe(release_steps: list[dict]):
+    """gh release create must publish the Windows .exe asset."""
+    assert steps_contain(release_steps, "gh release create", "windows-amd64.exe"), (
+        "gh release create must upload v3ke-*-windows-amd64.exe"
+    )
